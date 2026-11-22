@@ -1,25 +1,43 @@
-"""User commands ko RDP GUI actions me convert karta hai.
+"""Convert user commands into RDP GUI actions.
 
-Slash commands (/open chrome) aur plain text (open chrome, chrome kholo)
-dono yahin parse hote hain. Connection/screenshot commands bot.py me hain.
+Both slash commands (/open chrome) and plain text (open chrome) are parsed here.
+Connection and screenshot commands live in bot.py.
 """
 from __future__ import annotations
 
 import urllib.parse
 
 # ---------------------------------------------------------------------------
-# Presets — common kaam ke ready-made action sequences
+# Presets — ready-made action sequences
 # ---------------------------------------------------------------------------
 
 def a_open_app(app: str) -> list:
-    """Windows Run dialog (Win+R) se app kholna."""
+    """Open an app through the Windows Run dialog (Win+R)."""
     return [
         ("key", "win+r"),
         ("wait", 0.6),
+        ("key", "ctrl+a"),
+        ("wait", 0.2),
         ("text", app),
         ("wait", 0.3),
         ("key", "enter"),
         ("wait", 1.2),
+    ]
+
+
+def a_win_search(word: str) -> list:
+    """Open Win+R and type a word — WITHOUT pressing Enter.
+
+    Used by /win so a screenshot can be taken before and after Enter to tell
+    whether the app was found ("opened") or not ("not found").
+    """
+    return [
+        ("key", "win+r"),
+        ("wait", 0.6),
+        ("key", "ctrl+a"),
+        ("wait", 0.2),
+        ("text", word),
+        ("wait", 0.4),
     ]
 
 
@@ -28,7 +46,7 @@ def a_chrome() -> list:
 
 
 def a_search(query: str) -> list:
-    """Chrome kholkar Google par search."""
+    """Open Chrome and search on Google."""
     return a_chrome() + [
         ("key", "ctrl+l"),
         ("wait", 0.4),
@@ -40,7 +58,7 @@ def a_search(query: str) -> list:
 
 
 def a_goto(url: str) -> list:
-    """Chrome me URL kholna."""
+    """Open a URL in Chrome."""
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
     return a_chrome() + [
@@ -54,13 +72,13 @@ def a_goto(url: str) -> list:
 
 
 def a_webstore(name: str) -> list:
-    """Chrome Web Store me extension search."""
+    """Search an extension in the Chrome Web Store."""
     url = "https://chromewebstore.google.com/search/" + urllib.parse.quote(name)
     return a_goto(url) + [("wait", 1.5)]
 
 
 def a_run_cmd(command: str) -> list:
-    """PowerShell kholkar command chalana."""
+    """Open PowerShell and run a command."""
     return a_open_app("powershell") + [
         ("wait", 1.2),
         ("text", command),
@@ -115,7 +133,7 @@ WEB_ALIASES = {
 }
 
 # ---------------------------------------------------------------------------
-# Command words (English + Hinglish)
+# Command words (English + Hinglish aliases)
 # ---------------------------------------------------------------------------
 
 OPEN_WORDS = {"open", "khol", "kholo", "khola", "launch", "start"}
@@ -131,7 +149,7 @@ WAIT_WORDS = {"wait", "ruko"}
 SEQ_WORDS = {"seq", "sequence", "macro"}
 MOVE_WORDS = {"move"}
 
-# Sab verbs ka union — Hinglish fallback ke liye
+# Union of all verbs — used by the Hinglish fallback
 KNOWN_VERBS = (
     OPEN_WORDS
     | SEARCH_WORDS
@@ -151,7 +169,7 @@ KNOWN_VERBS = (
     }
 )
 
-# Sequence me bina prefix ke key step chalane ke liye
+# Bare key steps in a sequence
 KEY_NAMES = {
     "enter", "return", "esc", "escape", "tab", "space", "backspace", "delete", "del",
     "insert", "home", "end", "pageup", "pgup", "pagedown", "pgdn", "up", "down",
@@ -170,10 +188,10 @@ def looks_like_key(token: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def parse_command(text: str) -> tuple[list, str]:
-    """Text -> (actions, description). ValueError = samajh nahi aaya."""
+    """Text -> (actions, description). ValueError means "did not understand"."""
     raw = text.strip()
     if not raw:
-        raise ValueError("Kuch command likho.")
+        raise ValueError("Please type a command.")
 
     if raw.startswith("/"):
         tokens = raw.split()
@@ -186,11 +204,11 @@ def parse_command(text: str) -> tuple[list, str]:
     parts = raw.split()
     first = parts[0].lower()
 
-    # "go to instagram" jaisi phrases
+    # phrases like "go to instagram"
     if first in GOTO_WORDS and len(parts) > 1 and parts[1].lower() == "to":
         return _dispatch("goto", " ".join(parts[2:]))
 
-    # Hinglish: verb aakhir me bhi aa sakta hai — "chrome kholo", "instagram search"
+    # Hinglish: the verb may come at the end — "chrome kholo", "instagram search"
     if first not in KNOWN_VERBS and len(parts) > 1 and parts[-1].lower() in KNOWN_VERBS:
         verb = parts[-1].lower()
         return _dispatch(verb, " ".join(parts[:-1]))
@@ -201,32 +219,32 @@ def parse_command(text: str) -> tuple[list, str]:
 
 def _dispatch(word: str, arg: str) -> tuple[list, str]:
     if word in WEB_ALIASES:
-        # /instagram, /youtube, /gmail — bina args ke bhi chalega
+        # /instagram, /youtube, /gmail — works without arguments too
         return a_goto(WEB_ALIASES[word]), f"Opening {word}"
 
     if word in OPEN_WORDS:
         if not arg:
-            raise ValueError("Kya kholna hai? e.g. /open chrome")
+            raise ValueError("What should I open? e.g. /open chrome")
         return _open(arg)
 
     if word in SEARCH_WORDS:
         if not arg:
-            raise ValueError("Kya search karna hai? e.g. /search instagram")
+            raise ValueError("What should I search? e.g. /search instagram")
         return a_search(arg), f"Search: {arg}"
 
     if word in GOTO_WORDS:
         if not arg:
-            raise ValueError("Kaunsa URL? e.g. /goto instagram.com")
+            raise ValueError("Which URL? e.g. /goto instagram.com")
         return a_goto(arg), f"Opening: {arg}"
 
     if word in TYPE_WORDS:
         if not arg:
-            raise ValueError("Kya likhna hai? e.g. /type hello")
+            raise ValueError("What should I type? e.g. /type hello")
         return [("text", arg)], f"Typing: {arg}"
 
     if word in KEY_WORDS:
         if not arg:
-            raise ValueError("Kaunsa key? e.g. /key ctrl+shift+esc")
+            raise ValueError("Which key? e.g. /key ctrl+shift+esc")
         return [("key", arg)], f"Key: {arg}"
 
     if word in CLICK_WORDS:
@@ -237,15 +255,15 @@ def _dispatch(word: str, arg: str) -> tuple[list, str]:
 
     if word in INSTALL_WORDS:
         if not arg:
-            raise ValueError("Kaunsi extension? e.g. /install adblock")
+            raise ValueError("Which extension? e.g. /install adblock")
         return (
             a_webstore(arg),
-            f"Web Store kholi: {arg} — /screen se result dekho, phir /click se 'Add to Chrome'",
+            f"Web Store opened: {arg} — check /screen, then /click x y on 'Add to Chrome'",
         )
 
     if word in CMD_WORDS:
         if not arg:
-            raise ValueError("Kaunsi command? e.g. /cmd ipconfig")
+            raise ValueError("Which command? e.g. /cmd ipconfig")
         return a_run_cmd(arg), f"PowerShell: {arg}"
 
     if word in WAIT_WORDS:
@@ -253,14 +271,14 @@ def _dispatch(word: str, arg: str) -> tuple[list, str]:
 
     if word in SEQ_WORDS:
         if not arg:
-            raise ValueError("Sequence khaali hai. e.g. /seq win+r; type chrome; press enter")
-        return parse_sequence(arg), "Sequence chalayi"
+            raise ValueError("Empty sequence. e.g. /seq win+r; type chrome; press enter")
+        return parse_sequence(arg), "Running sequence"
 
     if word in MOVE_WORDS:
         return _move(arg)
 
     if word in ("close", "band", "bandh"):
-        return [("key", "alt+f4")], "Alt+F4 (window band)"
+        return [("key", "alt+f4")], "Alt+F4 (close window)"
 
     if word in ("lock",):
         return [("key", "win+l")], "Lock (Win+L)"
@@ -298,7 +316,7 @@ def _click(arg: str) -> tuple[list, str]:
     try:
         x, y = int(toks[0]), int(toks[1])
     except ValueError:
-        raise ValueError("Coordinates number hone chahiye")
+        raise ValueError("Coordinates must be numbers")
     button, double = 1, False
     for t in toks[2:]:
         tl = t.lower()
@@ -318,7 +336,7 @@ def _move(arg: str) -> tuple[list, str]:
     try:
         x, y = int(toks[0]), int(toks[1])
     except ValueError:
-        raise ValueError("Coordinates number hone chahiye")
+        raise ValueError("Coordinates must be numbers")
     return [("move", x, y)], f"Mouse move ({x}, {y})"
 
 
@@ -334,7 +352,7 @@ def _scroll(arg: str) -> tuple[list, str]:
 
 
 def parse_sequence(seq: str) -> list:
-    """'/seq win+r; type chrome; press enter; wait 2' -> actions"""
+    """/seq win+r; type chrome; press enter; wait 2 -> actions"""
     actions: list = []
     for step in seq.split(";"):
         step = step.strip()
@@ -349,14 +367,14 @@ def parse_sequence(seq: str) -> list:
         elif op in ("key", "press"):
             actions.append(("key", arg))
         elif looks_like_key(op):
-            # Bina prefix ke key step — "win+r", "ctrl+shift+esc", "enter"
+            # Bare key step — "win+r", "ctrl+shift+esc", "enter"
             actions.append(("key", op))
         elif op == "type":
             actions.append(("text", arg))
         elif op == "click":
             toks = arg.split()
             if len(toks) < 2:
-                raise ValueError(f"click step me x y chahiye: {step}")
+                raise ValueError(f"click step needs x y: {step}")
             button = 1
             double = False
             for t in toks[2:]:
@@ -371,7 +389,7 @@ def parse_sequence(seq: str) -> list:
         elif op == "move":
             toks = arg.split()
             if len(toks) < 2:
-                raise ValueError(f"move step me x y chahiye: {step}")
+                raise ValueError(f"move step needs x y: {step}")
             actions.append(("move", int(toks[0]), int(toks[1])))
         elif op == "scroll":
             toks = arg.split()

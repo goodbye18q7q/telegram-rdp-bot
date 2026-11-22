@@ -173,5 +173,57 @@ class TestConnectFlow(unittest.TestCase):
         self.assertNotIn(555, bot.connect_sessions)
 
 
+class TestWinCtrl(unittest.TestCase):
+    def setUp(self):
+        bot.mgr.execute = AsyncMock()
+        bot.mgr.connect = AsyncMock()
+        bot.mgr.screenshot = AsyncMock()
+        bot.connect_sessions.clear()
+        bot.cfg["allowed_users"] = []
+
+    @staticmethod
+    def img(color):
+        from PIL import Image
+
+        return Image.new("RGB", (120, 80), color)
+
+    def test_win_no_word(self):
+        update, msg = make_update("/win")
+        asyncio.run(bot.cmd_win(update, MagicMock()))
+        self.assertIn("Not found", msg.reply_text.await_args[0][0])
+        bot.mgr.execute.assert_not_awaited()
+
+    def test_win_opened(self):
+        update, msg = make_update("/win chrome")
+        ctx = MagicMock()
+        ctx.args = ["chrome"]
+        bot.mgr.screenshot = AsyncMock(side_effect=[self.img((0, 0, 0)), self.img((255, 255, 255))])
+        asyncio.run(bot.cmd_win(update, ctx))
+        self.assertIn("Opened", msg.reply_text.await_args[0][0])
+
+    def test_win_not_found(self):
+        update, msg = make_update("/win zzznotanapp")
+        ctx = MagicMock()
+        ctx.args = ["zzznotanapp"]
+        same = self.img((10, 10, 10))
+        bot.mgr.screenshot = AsyncMock(side_effect=[same, same])
+        asyncio.run(bot.cmd_win(update, ctx))
+        self.assertIn("Not found", msg.reply_text.await_args[0][0])
+
+    def test_ctrl(self):
+        update, msg = make_update("/ctrl hello")
+        ctx = MagicMock()
+        ctx.args = ["hello"]
+        asyncio.run(bot.cmd_ctrl(update, ctx))
+        self.assertIn("Typed", msg.reply_text.await_args[0][0])
+        actions = bot.mgr.execute.await_args[0][0]
+        self.assertEqual(actions[0], ("key", "ctrl+a"))
+        self.assertEqual(actions[2], ("text", "hello"))
+
+    def test_diff_ratio(self):
+        self.assertEqual(bot.diff_ratio(self.img((0, 0, 0)), self.img((0, 0, 0))), 0.0)
+        self.assertGreater(bot.diff_ratio(self.img((0, 0, 0)), self.img((255, 255, 255))), 0.9)
+
+
 if __name__ == "__main__":
     unittest.main()

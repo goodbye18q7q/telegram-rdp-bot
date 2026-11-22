@@ -98,6 +98,12 @@ class TestParser(unittest.TestCase):
         with self.assertRaises(ValueError):
             commands.parse_command("asdfghjkl")
 
+    def test_a_win_search(self):
+        acts = commands.a_win_search("chrome")
+        self.assertIn(("key", "win+r"), acts)
+        self.assertIn(("text", "chrome"), acts)
+        self.assertNotIn(("key", "enter"), acts)  # Enter is pressed later (for detection)
+
 
 class TestApply(unittest.IsolatedAsyncioTestCase):
     async def test_apply_combo(self):

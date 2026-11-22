@@ -1,7 +1,7 @@
-"""Telegram bot — remote Windows machine ko RDP se control karta hai.
+"""Telegram bot — controls a remote Windows machine over RDP.
 
-Commands (slash ya plain text) GUI actions me badal kar RDP par chalte hain.
-Connection commands (/connect, /disconnect, /status, /screen) yahin hain.
+Slash commands and plain text are turned into GUI actions and executed over RDP.
+Connection and screenshot commands (/connect, /disconnect, /status, /screen) live here.
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import threading
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 
+from PIL import ImageChops
+from PIL import ImageOps
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -35,61 +37,42 @@ log = logging.getLogger("rdpbot")
 cfg = load_config()
 mgr = RDPManager(cfg)
 
-# chat_id -> {"step": "ip"|"user"|"pass", "host": ..., "user": ...}
-# /connect ka step-by-step flow (ek-ek karke IP, username, password)
+# chat_id -> {"step": "ip"|"user"|"pass", "host": ..., "port": ...}
+# Step-by-step /connect flow (IP, then username, then password)
 connect_sessions: dict[int, dict] = {}
+
+# Minimum fraction of changed pixels to call an app "opened"
+OPENED_RATIO = 0.15
 
 HELP_TEXT = """🤖 RDP Control Bot
 
 🔌 Connection:
-/connect — step-by-step login (IP → username → password ek-ek karke poocha jayega)
-          IP me port bhi likh sakte ho: `IP:port` (jaise 1.2.3.4:65430)
-/connect ip user pass — sab ek saath bhi de sakte ho
-/cancel — connect flow beech me band karo
-/disconnect — session band
+/connect — step-by-step login (IP → username → password, one by one)
+          You can include the port too: IP:port (e.g. 1.2.3.4:65430)
+/connect ip user pass — or give everything at once
+/cancel — cancel the connect flow
+/disconnect — close the session
 /status — connection status
-/screen — desktop ki photo
+/screen — photo of the desktop
 
-⌨️ Commands (slash aur plain text dono chalega):
-/open chrome — app kholna (notepad, cmd, powershell, calc, mspaint...)
-/open instagram — website kholna
-/search instagram — Chrome me Google search
-/goto instagram.com — URL kholna
-/instagram — seedha Instagram
-/install adblock — Chrome Web Store kholna
-/cmd ipconfig — PowerShell me command chalana
-/type hello — text likhna (Hindi bhi chalega)
+⌨️ Commands (slash and plain text both work):
+/win chrome — open Run (Win+R) and search for an app or name
+/ctrl hello — Ctrl+A then type text into the focused app
+/open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
+/open instagram — open a website
+/search instagram — Google search in Chrome
+/goto instagram.com — open a URL
+/instagram — open Instagram directly
+/install adblock — open the Chrome Web Store
+/cmd ipconfig — run a command in PowerShell
+/type hello — type text (unicode works too)
 /key ctrl+shift+esc — shortcut (win+r, alt+f4, win+l...)
-/click 640 360 — mouse click (right/double bhi likh sakte ho)
+/click 640 360 — mouse click (right/double also supported)
 /scroll down 3
 /seq win+r; type chrome; press enter; wait 2; type instagram.com; press enter
 
-Plain examples: "open chrome", "search instagram", "chrome kholo", "instagram kholo"
+Plain examples: "open chrome", "search instagram", "win chrome"
 """
-
-
-def guarded(handler):
-    """Sirf ALLOWED_USERS ke messages process kare (empty = sab allow, warning ke saath)."""
-
-    @functools.wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        uname = update.effective_user.username if update.effective_user else None
-        log.info("Message aaya: user id=%s username=%s chat=%s", uid, uname, update.effective_chat.id if update.effective_chat else None)
-        if not cfg["allowed_users"]:
-            log.warning("ALLOWED_USERS set nahi hai — sab users allow hain!")
-        elif uid not in cfg["allowed_users"]:
-            if update.message:
-                await update.message.reply_text("⛔ Tum authorized nahi ho.")
-            return
-        return await handler(update, context)
-
-    return wrapper
-
-
-@guarded
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
 
 
 def split_host_port(text: str, default_port: int = 3389) -> tuple[str, int]:
@@ -108,6 +91,70 @@ def split_host_port(text: str, default_port: int = 3389) -> tuple[str, int]:
     return text, default_port
 
 
+def diff_ratio(img_a, img_b) -> float:
+    """Fraction of pixels that differ by more than 40 (grayscale)."""
+    a = ImageOps.grayscale(img_a)
+    b = ImageOps.grayscale(img_b)
+    if a.size != b.size:
+        b = b.resize(a.size)
+    hist = ImageChops.difference(a, b).histogram()
+    total = a.size[0] * a.size[1]
+    return sum(hist[40:]) / total if total else 0.0
+
+
+def start_health_server() -> None:
+    """Tiny HTTP server — health check / free-tier keep-alive ping.
+
+    Render free web services sleep after 15 min of inactivity. A free service
+    like UptimeRobot (or the GitHub Actions workflow in this repo) pings this
+    URL every 5 minutes so the service stays awake.
+    """
+    port = int(os.environ.get("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (http.server API)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass  # keep it quiet
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on :%s", port)
+
+
+def guarded(handler):
+    """Only ALLOWED_USERS may use the bot (empty = allow everyone, with a warning)."""
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id if update.effective_user else 0
+        uname = update.effective_user.username if update.effective_user else None
+        log.info(
+            "Message from user id=%s username=%s chat=%s",
+            uid,
+            uname,
+            update.effective_chat.id if update.effective_chat else None,
+        )
+        if not cfg["allowed_users"]:
+            log.warning("ALLOWED_USERS is not set — everyone is allowed!")
+        elif uid not in cfg["allowed_users"]:
+            if update.message:
+                await update.message.reply_text("⛔ You are not authorized.")
+            return
+        return await handler(update, context)
+
+    return wrapper
+
+
+@guarded
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT)
+
+
 async def _do_connect(update: Update) -> None:
     try:
         await mgr.connect()
@@ -122,7 +169,7 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = context.args or []
     chat_id = update.effective_chat.id
 
-    # Poora creds ek saath diya: seedha connect
+    # Full credentials given at once: connect directly
     if len(args) >= 3:
         host, port = split_host_port(args[0])
         cfg["rdp_host"] = host
@@ -139,7 +186,7 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _do_connect(update)
         return
 
-    # Step-by-step flow shuru karo
+    # Start the step-by-step flow
     session = {"step": "ip"}
     if len(args) == 1:
         host, port = split_host_port(args[0])
@@ -153,7 +200,7 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         session["user"] = args[1]
         session["step"] = "pass"
     elif cfg.get("rdp_host"):
-        # Env se host already set hai — IP nahi puchna
+        # Host already set from env — no need to ask for it
         host, port = split_host_port(cfg["rdp_host"])
         session["host"] = host
         session["port"] = port
@@ -163,16 +210,16 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if session["step"] == "ip":
         await update.message.reply_text(
-            "🔌 RDP connect — pehle IP address bhejo.\n"
-            "Port 3389 hai to sirf IP likho (1.2.3.4).\n"
-            "Alag port hai to `IP:port` likho — jaise `1.2.3.4:65430`.\n"
-            "Band karne ke liye /cancel."
+            "🔌 RDP connect — send the IP address first.\n"
+            "Port is 3389: send just the IP (1.2.3.4).\n"
+            "Different port: send IP:port — e.g. 1.2.3.4:65430.\n"
+            "Send /cancel to stop."
         )
     elif session["step"] == "user":
-        await update.message.reply_text(f"🌐 IP: {session['host']}\n👤 Ab username bhejo:")
+        await update.message.reply_text(f"🌐 IP: {session['host']}  Port: {session['port']}\n👤 Now send the username:")
     else:
         await update.message.reply_text(
-            f"🌐 IP: {session['host']}  👤 {session['user']}\n🔑 Ab password bhejo:"
+            f"🌐 IP: {session['host']}  👤 {session['user']}\n🔑 Now send the password:"
         )
 
 
@@ -186,15 +233,13 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
         session["host"] = host
         session["port"] = port
         session["step"] = "user"
-        await update.message.reply_text(
-            f"🌐 Host: {host}  Port: {port}\n👤 Ab username bhejo:"
-        )
+        await update.message.reply_text(f"🌐 Host: {host}  Port: {port}\n👤 Now send the username:")
     elif step == "user":
         session["user"] = text
         session["step"] = "pass"
         await update.message.reply_text(
-            "🔑 Ab password bhejo:\n"
-            "⚠️ Password chat history me save ho jayega — connect ke baad ye message delete kar dena."
+            "🔑 Now send the password:\n"
+            "⚠️ The password will be saved in the chat history — delete this message after connecting."
         )
     else:
         cfg["rdp_host"] = session.get("host") or cfg["rdp_host"]
@@ -209,9 +254,9 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if connect_sessions.pop(chat_id, None):
-        await update.message.reply_text("❌ Connect flow cancel ho gaya.")
+        await update.message.reply_text("❌ Connect flow cancelled.")
     else:
-        await update.message.reply_text("Koi chalu connect flow nahi hai.")
+        await update.message.reply_text("No connect flow is running.")
 
 
 @guarded
@@ -237,7 +282,54 @@ async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     except Exception as e:
         log.exception("screenshot failed")
-        await update.message.reply_text(f"❌ Screenshot fail: {e}")
+        await update.message.reply_text(f"❌ Screenshot failed: {e}")
+
+
+async def _win_flow(update: Update, word: str) -> None:
+    """Win+R + type a word + Enter, then report Opened / Not found."""
+    if not word:
+        await update.message.reply_text("Not found: no search word given (/win <word>)")
+        return
+    try:
+        # Open Run and type the word (no Enter yet)
+        await mgr.execute(commands.a_win_search(word))
+        before = await mgr.screenshot()
+        await mgr.execute([("key", "enter"), ("wait", 1.8)])
+        after = await mgr.screenshot()
+
+        ratio = diff_ratio(before, after)
+        log.info("win search %r -> changed ratio %.3f", word, ratio)
+
+        if ratio >= OPENED_RATIO:
+            await update.message.reply_text(f"Opened: {word}")
+        else:
+            await update.message.reply_text(f"Not found: {word}")
+    except Exception as e:
+        log.exception("win search failed")
+        await update.message.reply_text(f"Error: {e}")
+
+
+@guarded
+async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _win_flow(update, " ".join(context.args or []).strip())
+
+
+async def _ctrl_flow(update: Update, word: str) -> None:
+    """Ctrl+A then type — replaces the current selection in the focused app."""
+    if not word:
+        await update.message.reply_text("Usage: /ctrl <text>")
+        return
+    try:
+        await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("text", word)])
+        await update.message.reply_text(f"Typed: {word}")
+    except Exception as e:
+        log.exception("ctrl type failed")
+        await update.message.reply_text(f"Error: {e}")
+
+
+@guarded
+async def cmd_ctrl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _ctrl_flow(update, " ".join(context.args or []).strip())
 
 
 @guarded
@@ -246,13 +338,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     text = update.message.text.strip()
 
-    # /connect ka step-by-step flow chal raha hai to answer yahin jayega
+    # /win and /ctrl step-by-step flows
     session = connect_sessions.get(update.effective_chat.id)
     if session:
         return await _handle_connect_step(update, session)
 
-    # Plain-text shortcuts for connection/screen commands
     low = text.lower()
+
+    # Plain-text shortcuts
     if low in ("screen", "screenshot", "photo", "desktop photo"):
         return await cmd_screen(update, context)
     if low in ("connect", "login"):
@@ -261,11 +354,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return await cmd_disconnect(update, context)
     if low in ("status",):
         return await cmd_status(update, context)
+    if low == "win" or low.startswith("win "):
+        return await _win_flow(update, text[3:].strip())
+    if low == "ctrl" or low.startswith("ctrl "):
+        return await _ctrl_flow(update, text[4:].strip())
 
     try:
         actions, desc = commands.parse_command(text)
     except ValueError as e:
-        await update.message.reply_text(f"⚠️ {e}\n\nCommands dekho: /start")
+        await update.message.reply_text(f"⚠️ {e}\n\nType /start to see the commands.")
         return
 
     try:
@@ -276,32 +373,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"❌ Error: {e}")
 
 
-def start_health_server() -> None:
-    """Chhota sa HTTP server — health check / free-tier keep-alive ping ke liye.
-
-    Render free web services 15 min idle par sleep ho jate hain. UptimeRobot jaisi
-    free service is URL ko har 5 min ping karti hai, jisse service jaagti rehti hai.
-    """
-    port = int(os.environ.get("PORT", "10000"))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 (http.server API)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, *args):
-            pass  # shanti rakho
-
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Health server chal raha hai :%s par", port)
-
-
 def main() -> None:
     if not cfg["telegram_token"]:
-        raise SystemExit("TELEGRAM_TOKEN missing — env me set karo")
+        raise SystemExit("TELEGRAM_TOKEN missing — set it in the environment")
 
     start_health_server()
 
@@ -313,13 +387,15 @@ def main() -> None:
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("screen", cmd_screen))
+    app.add_handler(CommandHandler("win", cmd_win))
+    app.add_handler(CommandHandler("ctrl", cmd_ctrl))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Unhandled error: %s", context.error, exc_info=context.error)
 
     app.add_error_handler(on_error)
-    log.info("Bot start ho raha hai...")
+    log.info("Bot is starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
