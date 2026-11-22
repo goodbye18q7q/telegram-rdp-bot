@@ -89,11 +89,12 @@ Then send `/start` to your bot, then `/connect` and follow the prompts.
 
 **Connection / profiles (multiple RDPs)**
 - `/add RDP1 1.2.3.4:3389 user pass` — save a profile (host may include `:port`)
-- `/connect RDP1` — connect to a saved profile
+- `/connect RDP1` — connect to a saved profile (**always a fresh connection** — any
+  existing connection to that profile is closed first)
 - `/connect` — **step-by-step login**: the bot asks for IP → username → password,
   and saves it as the next free name (`RDP1`, `RDP2`, ...)
 - `/connect ip user pass` — or give everything at once
-- `/rdp RDP1` — switch the active profile (plain `/rdp1`, `rdp 1` also work)
+- `/rdp RDP1` — switch the active profile (`/rdp1`, `rdp 1`, `switch1`, `switch 1` also work)
 - `/list` — all profiles with active/connected status
 - `/remove RDP1` — delete a profile
 - `/cancel` — cancel the connect flow
@@ -105,10 +106,12 @@ Then send `/start` to your bot, then `/connect` and follow the prompts.
 > redeploy; re-add them with `/add`.
 
 **Search / apps / web**
-- `/win chrome` — open **Run (Win+R)** and search for an app or name.
+- `/win chrome` — open **Run (Win+R)** and search for an app or name. Any text already
+  in the box is **cleared first** (Ctrl+A → Backspace), so it always types your word.
   The bot replies **`Opened: <word>`** or **`Not found: <word>`** by comparing
   the screen before and after pressing Enter.
 - `/ctrl hello` — **Ctrl+A** then type text into the focused app
+- `/edge` — open **Microsoft Edge** (also `/open edge`, plain `edge`)
 - `/open chrome` — open any app (notepad, cmd, powershell, calc, mspaint, taskmgr...)
 - `/open instagram` or `/instagram` — open a website
 - `/search instagram` — Google search in Chrome
@@ -136,6 +139,10 @@ Parser + action engine + handler wiring unit tests (no real RDP server needed).
 - **Connection failed / refused** → is `RDP_HOST` correct? Is port 3389 (or your custom
   port) open? Does Windows Firewall allow Remote Desktop?
 - **NLA / CredSSP error** → RDP must be enabled **with NLA** on Windows (default).
+- **`Expected Demand Active PDU, got type 0x17`** → some servers (RD Gateway, xrdp,
+  hardened Windows) send a Data PDU before the Demand Active PDU. The bot patches
+  simple-rdp to skip those PDUs and retry the connection, so this is handled
+  automatically. If it still fails, send `/connect` again (each attempt is fresh).
 - **Bot does not answer** → free Render services sleep; the keep-alive ping keeps it
   awake. Check the GitHub Actions workflow runs.
 - **Chrome does not open** → is Chrome installed? Check with `/screen` after `/open chrome`.

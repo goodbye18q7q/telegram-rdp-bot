@@ -145,6 +145,37 @@ class TestProfiles(BotTestCase):
         fake.connect.assert_awaited_once()
         self.assertEqual(bot.current["name"], "rdp2")
 
+    def test_switch1_alias(self):
+        self.save_profile(name="rdp1", host="10.0.0.1")
+        fake = self.use_fake()
+        update, msg = make_update("switch1")
+        asyncio.run(bot.on_message(update, MagicMock()))
+        fake.connect.assert_awaited_once()
+        self.assertEqual(bot.current["name"], "rdp1")
+
+    def test_switch_slash_command(self):
+        self.save_profile(name="rdp1", host="10.0.0.1")
+        fake = self.use_fake()
+        update, msg = make_update("/switch 1")
+        ctx = MagicMock()
+        ctx.args = ["1"]
+        asyncio.run(bot.cmd_switch(update, ctx))
+        fake.connect.assert_awaited_once()
+        self.assertEqual(bot.current["name"], "rdp1")
+
+    def test_connect_is_always_fresh(self):
+        # Pehle se connected ho to bhi /connect purani band karke naya khole
+        self.save_profile(name="rdp1", host="10.0.0.1")
+        old = fake_manager()
+        bot.managers["rdp1"] = old
+        bot.get_mgr = lambda name=None: old
+        update, msg = make_update("/connect rdp1")
+        ctx = MagicMock()
+        ctx.args = ["rdp1"]
+        asyncio.run(bot.cmd_connect(update, ctx))
+        old.disconnect.assert_awaited_once()
+        old.connect.assert_awaited_once()
+
     def test_connect_saved_profile(self):
         self.save_profile(name="rdp1", host="10.0.0.1")
         fake = self.use_fake()
@@ -272,6 +303,109 @@ class TestWinCtrl(BotTestCase):
     def test_diff_ratio(self):
         self.assertEqual(bot.diff_ratio(self.img((0, 0, 0)), self.img((0, 0, 0))), 0.0)
         self.assertGreater(bot.diff_ratio(self.img((0, 0, 0)), self.img((255, 255, 255))), 0.9)
+
+
+class TestRdpPatch(unittest.IsolatedAsyncioTestCase):
+    """simple-rdp ka 0x17 (Data PDU) tolerance patch."""
+
+    def test_patch_applied(self):
+        import simple_rdp.client as cm
+
+        self.assertTrue(
+            getattr(cm.RDPClient._handle_capability_exchange, "_rdpbot_tolerant_patched", False)
+        )
+
+    async def test_skips_data_pdu_then_succeeds(self):
+        import simple_rdp.client as cm
+
+        calls = {"n": 0}
+
+        async def fake_original(self):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionError("Expected Demand Active PDU, got type 0x17")
+            return "ok"
+
+        import rdp_patch
+
+        real = rdp_patch._original
+        rdp_patch._original = fake_original
+        try:
+            result = await rdp_patch._tolerant_capability_exchange(object())
+            self.assertEqual(result, "ok")
+            self.assertEqual(calls["n"], 3)
+        finally:
+            rdp_patch._original = real
+
+    async def test_gives_up_after_max_skip(self):
+        import rdp_patch
+
+        async def always_bad(self):
+            raise ConnectionError("Expected Demand Active PDU, got type 0x17")
+
+        real = rdp_patch._original
+        rdp_patch._original = always_bad
+        try:
+            with self.assertRaises(ConnectionError):
+                await rdp_patch._tolerant_capability_exchange(object())
+        finally:
+            rdp_patch._original = real
+
+    async def test_other_errors_propagate(self):
+        import rdp_patch
+
+        async def boom(self):
+            raise ConnectionError("auth failed")
+
+        real = rdp_patch._original
+        rdp_patch._original = boom
+        try:
+            with self.assertRaises(ConnectionError):
+                await rdp_patch._tolerant_capability_exchange(object())
+        finally:
+            rdp_patch._original = real
+
+    async def test_real_method_skips_0x17(self):
+        """Asli _handle_capability_exchange: pehle 0x17, phir Demand Active -> success."""
+        import simple_rdp.client as cm
+
+        # 0x17 = Data PDU (6-byte share control header), 0x11 = Demand Active
+        data_pdu = b"\x00\x00" + b"\x17\x00" + b"\x00\x00" + b"\x00" * 20
+        active_pdu = b"\x00\x00" + b"\x11\x00" + b"\x00\x00" + b"\x00" * 40
+
+        sent = []
+
+        class Stub:
+            _width, _height, _color_depth, _io_channel_id = 1920, 1080, 32, 1003
+
+            def __init__(self):
+                self._pending_data = None
+                self._share_id = None
+
+            async def _recv_x224_data(self):
+                return active_pdu  # pehli baar Data PDU pending se aayega
+
+            def _extract_pdu_from_mcs(self, response):
+                return response
+
+            async def _send_mcs_data(self, data, channel):
+                sent.append(data)
+
+            def _build_share_control_pdu(self, pdu_type, data):
+                return b"\x00" * 6 + data
+
+        stub = Stub()
+        stub._pending_data = data_pdu
+
+        real_parse = cm.parse_demand_active_pdu
+        cm.parse_demand_active_pdu = lambda b: {"share_id": 1234}
+        try:
+            await cm.RDPClient._handle_capability_exchange(stub)
+        finally:
+            cm.parse_demand_active_pdu = real_parse
+
+        self.assertEqual(stub._share_id, 1234)
+        self.assertTrue(sent, "Confirm Active PDU bheja jana chahiye")
 
 
 if __name__ == "__main__":

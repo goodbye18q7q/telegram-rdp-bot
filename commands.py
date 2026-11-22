@@ -11,13 +11,22 @@ import urllib.parse
 # Presets — ready-made action sequences
 # ---------------------------------------------------------------------------
 
+def _clear_field() -> list:
+    """Select all + delete — purana text (jaise 'chrome') hata deta hai."""
+    return [
+        ("key", "ctrl+a"),
+        ("wait", 0.2),
+        ("key", "backspace"),
+        ("wait", 0.2),
+    ]
+
+
 def a_open_app(app: str) -> list:
     """Open an app through the Windows Run dialog (Win+R)."""
     return [
         ("key", "win+r"),
         ("wait", 0.6),
-        ("key", "ctrl+a"),
-        ("wait", 0.2),
+        *_clear_field(),
         ("text", app),
         ("wait", 0.3),
         ("key", "enter"),
@@ -34,8 +43,7 @@ def a_win_search(word: str) -> list:
     return [
         ("key", "win+r"),
         ("wait", 0.6),
-        ("key", "ctrl+a"),
-        ("wait", 0.2),
+        *_clear_field(),
         ("text", word),
         ("wait", 0.4),
     ]
@@ -98,6 +106,8 @@ APP_ALIASES = {
     "brave": "brave",
     "firefox": "firefox",
     "edge": "msedge",
+    "msedge": "msedge",
+    "microsoft edge": "msedge",
     "notepad": "notepad",
     "cmd": "cmd",
     "command prompt": "cmd",
@@ -145,6 +155,7 @@ CLICK_WORDS = {"click", "tika", "tap"}
 SCROLL_WORDS = {"scroll"}
 INSTALL_WORDS = {"install", "webstore", "extension"}
 CMD_WORDS = {"cmd", "command", "execute", "run", "chala", "chalao", "chalana"}
+EDGE_WORDS = {"edge", "msedge", "microsoft edge"}
 WAIT_WORDS = {"wait", "ruko"}
 SEQ_WORDS = {"seq", "sequence", "macro"}
 MOVE_WORDS = {"move"}
@@ -163,6 +174,7 @@ KNOWN_VERBS = (
     | WAIT_WORDS
     | SEQ_WORDS
     | MOVE_WORDS
+    | EDGE_WORDS
     | {
         "close", "band", "bandh", "lock", "taskmanager", "fullscreen", "full",
         "desktop", "esc", "escape", "enter", "return",
@@ -221,6 +233,9 @@ def _dispatch(word: str, arg: str) -> tuple[list, str]:
     if word in WEB_ALIASES:
         # /instagram, /youtube, /gmail — works without arguments too
         return a_goto(WEB_ALIASES[word]), f"Opening {word}"
+
+    if word in EDGE_WORDS:
+        return a_open_app("msedge") + [("wait", 2.0)], "Opening Microsoft Edge"
 
     if word in OPEN_WORDS:
         if not arg:

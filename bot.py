@@ -54,9 +54,9 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 
 🔌 Profiles:
 /add RDP1 1.2.3.4:3389 user pass — save a profile (host may include :port)
-/connect RDP1                 — connect to a saved profile
+/connect RDP1                 — connect to a saved profile (always a fresh connection)
 /connect                      — step by step (IP → username → password), saves as RDP1, RDP2...
-/rdp RDP1   or   /rdp1        — switch the active profile
+/rdp RDP1   /rdp1   switch1   — switch the active profile
 /list                         — all profiles (active + connected)
 /remove RDP1                  — delete a profile
 /disconnect                   — close the active connection
@@ -65,8 +65,9 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /screen                       — photo of the active desktop
 
 ⌨️ Commands (they act on the ACTIVE profile):
-/win chrome — open Run (Win+R) and search for an app or name
+/win chrome — open Run (Win+R), clear any old text, search an app or name
 /ctrl hello — Ctrl+A then type text into the focused app
+/edge                         — open Microsoft Edge
 /open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
 /open instagram — open a website
 /search instagram — Google search in Chrome
@@ -80,7 +81,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /scroll down 3
 /seq win+r; type chrome; press enter; wait 2; type instagram.com; press enter
 
-Plain examples: "open chrome", "search instagram", "win chrome", "rdp2"
+Plain examples: "open chrome", "search instagram", "win chrome", "edge", "rdp2", "switch1"
 """
 
 
@@ -231,13 +232,22 @@ def guarded(handler):
 # ---------------------------------------------------------------------------
 
 async def _do_connect(update: Update, name: str | None = None) -> None:
+    """Hamesha FRESH connection — purani (agar hai) band karke naya khole."""
     try:
+        key = mgr_key(name)
+        old = managers.pop(key, None)
+        if old is not None:
+            try:
+                await old.disconnect()
+            except Exception:
+                pass
+
         mgr = get_mgr(name)
         await mgr.connect()
-        p = profiles.get(mgr_key(name), {})
+        p = profiles.get(key, {})
         host = p.get("host", current["host"])
         port = p.get("port", current["port"])
-        await update.message.reply_text(f"✅ Connected: {mgr_key(name)} — {host}:{port}")
+        await update.message.reply_text(f"✅ Connected: {key} — {host}:{port}")
     except Exception as e:
         log.exception("connect failed")
         await update.message.reply_text(f"❌ Connection failed:\n{e}")
@@ -303,6 +313,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/rdp <name> — make a profile active and connect to it."""
     name = (context.args or [""])[0].lower()
+    if name.isdigit():
+        name = f"rdp{name}"
     if name not in profiles:
         await update.message.reply_text(
             f"Profile not found: {name}\nSaved: {', '.join(sorted(profiles)) or 'none'}\nUse /add to save one."
@@ -478,6 +490,17 @@ async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _win_flow(update, " ".join(context.args or []).strip())
 
 
+@guarded
+async def cmd_edge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open Microsoft Edge."""
+    try:
+        await get_mgr().execute(commands.a_open_app("msedge") + [("wait", 2.0)])
+        await update.message.reply_text("✅ Opening Microsoft Edge")
+    except Exception as e:
+        log.exception("edge failed")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
 async def _ctrl_flow(update: Update, word: str) -> None:
     """Ctrl+A then type — replaces the current selection in the focused app."""
     if not word:
@@ -526,15 +549,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if low == "ctrl" or low.startswith("ctrl "):
         return await _ctrl_flow(update, text[4:].strip())
 
-    # Profile switching: "rdp2", "rdp 2", "rdp rdp2", "/rdp2"
+    # Profile switching: "rdp2", "rdp 2", "/rdp2", "switch1", "switch 2", "/switch1"
     sw = low[1:] if low.startswith("/") else low
-    if sw.startswith("rdp"):
-        rest = sw[3:].strip()
-        if rest.isdigit():
-            rest = f"rdp{rest}"
-        if rest:
-            context.args = [rest]
-            return await cmd_switch(update, context)
+    for prefix in ("rdp", "switch"):
+        if sw.startswith(prefix):
+            rest = sw[len(prefix):].strip()
+            if rest.isdigit():
+                rest = f"rdp{rest}"
+            if rest:
+                context.args = [rest]
+                return await cmd_switch(update, context)
 
     try:
         actions, desc = commands.parse_command(text)
@@ -563,6 +587,8 @@ def main() -> None:
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("rdp", cmd_switch))
+    app.add_handler(CommandHandler("switch", cmd_switch))
+    app.add_handler(CommandHandler("edge", cmd_edge))
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))

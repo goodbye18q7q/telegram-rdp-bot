@@ -7,9 +7,14 @@ import logging
 
 from simple_rdp import RDPClient
 
+import rdp_patch
 from actions import apply_action
 
+rdp_patch.apply()
+
 log = logging.getLogger(__name__)
+
+CONNECT_ATTEMPTS = 3
 
 
 class RDPManager:
@@ -45,7 +50,23 @@ class RDPManager:
             height=cfg["rdp_height"],
             capture_fps=cfg["capture_fps"],
         )
-        await client.connect()
+
+        # RDP handshake kabhi-kabhi flaky hota hai (0x17 jaise PDU issues) — retry.
+        last: Exception | None = None
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            try:
+                await client.connect()
+                break
+            except Exception as e:
+                last = e
+                log.warning("connect attempt %d/%d failed: %s", attempt, CONNECT_ATTEMPTS, e)
+                with contextlib.suppress(Exception):
+                    await client.disconnect()
+                if attempt < CONNECT_ATTEMPTS:
+                    await asyncio.sleep(1.0 * attempt)
+        else:
+            raise last  # type: ignore[misc]
+
         self.client = client
         log.info("RDP connected: %s:%s", cfg["rdp_host"], cfg["rdp_port"])
 

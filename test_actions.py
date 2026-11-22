@@ -104,6 +104,18 @@ class TestParser(unittest.TestCase):
         self.assertIn(("text", "chrome"), acts)
         self.assertNotIn(("key", "enter"), acts)  # Enter is pressed later (for detection)
 
+    def test_open_clears_existing_text(self):
+        # Win+R box me purana text ho to pehle clear ho (ctrl+a + backspace)
+        for acts in (commands.a_win_search("chrome"), commands.a_open_app("chrome")):
+            i = acts.index(("key", "ctrl+a"))
+            self.assertEqual(acts[i + 1], ("wait", 0.2))
+            self.assertEqual(acts[i + 2], ("key", "backspace"))
+
+    def test_edge(self):
+        self.assertEqual(commands.parse_command("edge")[1], "Opening Microsoft Edge")
+        self.assertIn(("text", "msedge"), commands.parse_command("open edge")[0])
+        self.assertIn("msedge", commands.APP_ALIASES["msedge"])
+
 
 class TestApply(unittest.IsolatedAsyncioTestCase):
     async def test_apply_combo(self):
