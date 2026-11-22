@@ -60,6 +60,15 @@ class BotTestCase(unittest.TestCase):
 
 
 class TestWiring(BotTestCase):
+    def test_all_handlers_defined(self):
+        # main() jo handlers register karta hai, sab exist karne chahiye
+        for name in (
+            "cmd_start", "cmd_add", "cmd_remove", "cmd_list", "cmd_switch", "cmd_connect",
+            "cmd_cancel", "cmd_disconnect", "cmd_status", "cmd_screen", "cmd_win", "cmd_ctrl",
+            "on_message",
+        ):
+            self.assertTrue(hasattr(bot, name), f"missing handler: {name}")
+
     def test_open_chrome(self):
         fake = self.use_fake()
         update, msg = make_update("open chrome")

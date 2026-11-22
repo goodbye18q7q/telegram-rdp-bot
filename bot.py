@@ -244,6 +244,11 @@ async def _do_connect(update: Update, name: str | None = None) -> None:
 
 
 @guarded
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT)
+
+
+@guarded
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Save a profile: /add <name> <host[:port]> <user> <password>"""
     args = context.args or []
