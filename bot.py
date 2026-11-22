@@ -14,6 +14,12 @@ import threading
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 
+# Logging pehle set karo — rdp_manager import karte hi patch log hona chahiye
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+
 from PIL import ImageChops
 from PIL import ImageOps
 from telegram import Update
@@ -29,10 +35,6 @@ import commands
 from config import load_config
 from rdp_manager import RDPManager
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
 log = logging.getLogger("rdpbot")
 
 cfg = load_config()
