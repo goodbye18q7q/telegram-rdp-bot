@@ -125,6 +125,32 @@ class TestConnectFlow(unittest.TestCase):
         self.assertEqual(bot.connect_sessions[555]["step"], "user")
         self.assertEqual(bot.connect_sessions[555]["host"], "env-host")
 
+    def test_split_host_port(self):
+        self.assertEqual(bot.split_host_port("1.2.3.4"), ("1.2.3.4", 3389))
+        self.assertEqual(bot.split_host_port("1.2.3.4:65430"), ("1.2.3.4", 65430))
+        self.assertEqual(bot.split_host_port(" 103.76.214.2:65430 "), ("103.76.214.2", 65430))
+        self.assertEqual(bot.split_host_port("[2001:db8::1]:3389"), ("2001:db8::1", 3389))
+
+    def test_flow_parses_ip_port(self):
+        # User ne "IP:port" poora bhara tha — ab sahi parse hona chahiye
+        update, _ = make_update("/connect")
+        ctx = MagicMock()
+        ctx.args = []
+        asyncio.run(bot.cmd_connect(update, ctx))
+
+        u2, _ = make_update("103.76.214.2:65430")
+        asyncio.run(bot.on_message(u2, MagicMock()))
+        self.assertEqual(bot.connect_sessions[555]["host"], "103.76.214.2")
+        self.assertEqual(bot.connect_sessions[555]["port"], 65430)
+
+        u3, _ = make_update("Administrator")
+        asyncio.run(bot.on_message(u3, MagicMock()))
+        u4, _ = make_update("pw123")
+        asyncio.run(bot.on_message(u4, MagicMock()))
+        bot.mgr.connect.assert_awaited_once()
+        self.assertEqual(bot.cfg["rdp_host"], "103.76.214.2")
+        self.assertEqual(bot.cfg["rdp_port"], 65430)
+
     def test_cancel(self):
         update, _ = make_update("/connect")
         ctx = MagicMock()

@@ -43,6 +43,7 @@ HELP_TEXT = """🤖 RDP Control Bot
 
 🔌 Connection:
 /connect — step-by-step login (IP → username → password ek-ek karke poocha jayega)
+          IP me port bhi likh sakte ho: `IP:port` (jaise 1.2.3.4:65430)
 /connect ip user pass — sab ek saath bhi de sakte ho
 /cancel — connect flow beech me band karo
 /disconnect — session band
@@ -91,6 +92,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT)
 
 
+def split_host_port(text: str, default_port: int = 3389) -> tuple[str, int]:
+    """'1.2.3.4:65430' -> ('1.2.3.4', 65430); '1.2.3.4' -> ('1.2.3.4', 3389)"""
+    text = text.strip()
+    if text.startswith("["):  # IPv6: [2001:db8::1]:3389
+        host, _, rest = text.partition("]")
+        port_s = rest.lstrip(":") or str(default_port)
+        return host.lstrip("["), int(port_s)
+    if ":" in text:
+        host, _, port_s = text.rpartition(":")
+        try:
+            return host.strip(), int(port_s)
+        except ValueError:
+            pass
+    return text, default_port
+
+
 async def _do_connect(update: Update) -> None:
     try:
         await mgr.connect()
@@ -107,14 +124,17 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Poora creds ek saath diya: seedha connect
     if len(args) >= 3:
-        cfg["rdp_host"] = args[0]
+        host, port = split_host_port(args[0])
+        cfg["rdp_host"] = host
         cfg["rdp_user"] = args[1]
         cfg["rdp_pass"] = args[2]
         if len(args) >= 4:
             try:
                 cfg["rdp_port"] = int(args[3])
             except ValueError:
-                pass
+                cfg["rdp_port"] = port
+        else:
+            cfg["rdp_port"] = port
         connect_sessions.pop(chat_id, None)
         await _do_connect(update)
         return
@@ -122,22 +142,31 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Step-by-step flow shuru karo
     session = {"step": "ip"}
     if len(args) == 1:
-        session["host"] = args[0]
+        host, port = split_host_port(args[0])
+        session["host"] = host
+        session["port"] = port
         session["step"] = "user"
     elif len(args) == 2:
-        session["host"] = args[0]
+        host, port = split_host_port(args[0])
+        session["host"] = host
+        session["port"] = port
         session["user"] = args[1]
         session["step"] = "pass"
     elif cfg.get("rdp_host"):
         # Env se host already set hai — IP nahi puchna
-        session["host"] = cfg["rdp_host"]
+        host, port = split_host_port(cfg["rdp_host"])
+        session["host"] = host
+        session["port"] = port
         session["step"] = "user"
 
     connect_sessions[chat_id] = session
 
     if session["step"] == "ip":
         await update.message.reply_text(
-            "🔌 RDP connect — pehle IP address bhejo (port 3389). Band karne ke liye /cancel."
+            "🔌 RDP connect — pehle IP address bhejo.\n"
+            "Port 3389 hai to sirf IP likho (1.2.3.4).\n"
+            "Alag port hai to `IP:port` likho — jaise `1.2.3.4:65430`.\n"
+            "Band karne ke liye /cancel."
         )
     elif session["step"] == "user":
         await update.message.reply_text(f"🌐 IP: {session['host']}\n👤 Ab username bhejo:")
@@ -153,9 +182,13 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
     step = session["step"]
 
     if step == "ip":
-        session["host"] = text
+        host, port = split_host_port(text)
+        session["host"] = host
+        session["port"] = port
         session["step"] = "user"
-        await update.message.reply_text("👤 Ab username bhejo:")
+        await update.message.reply_text(
+            f"🌐 Host: {host}  Port: {port}\n👤 Ab username bhejo:"
+        )
     elif step == "user":
         session["user"] = text
         session["step"] = "pass"
@@ -165,6 +198,7 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
         )
     else:
         cfg["rdp_host"] = session.get("host") or cfg["rdp_host"]
+        cfg["rdp_port"] = session.get("port", cfg["rdp_port"])
         cfg["rdp_user"] = session.get("user", "")
         cfg["rdp_pass"] = text
         connect_sessions.pop(chat_id, None)
