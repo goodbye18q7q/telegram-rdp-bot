@@ -1,0 +1,14 @@
+# Secrets — kabhi commit mat karna
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Local test screenshots
+*.png
+
+# OS
+.DS_Store

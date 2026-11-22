@@ -1,0 +1,35 @@
+# Render Blueprint — isse repo connect karke "New + Worker" (Blueprint) se ek click me deploy ho jayega.
+# Note: Worker ko 24/7 awake rakhne ke liye 'starter' plan recommended hai.
+# Free web services 15 min idle par sleep ho jate hain, aur free tier par workers nahi hote.
+services:
+  - type: worker
+    name: telegram-rdp-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false        # dashboard par khud bharo
+      - key: ALLOWED_USERS
+        sync: false        # apne Telegram user ID(s), comma separated
+      - key: RDP_HOST
+        sync: false        # Windows machine ka IP / hostname
+      - key: RDP_PORT
+        value: "3389"
+      - key: RDP_USER
+        sync: false
+      - key: RDP_PASS
+        sync: false
+      - key: RDP_DOMAIN
+        value: ""
+      - key: RDP_WIDTH
+        value: "1366"
+      - key: RDP_HEIGHT
+        value: "768"
+      - key: CAPTURE_FPS
+        value: "5"
+      - key: TYPE_CPS
+        value: "12"
+      - key: PYTHON_VERSION
+        value: "3.12"

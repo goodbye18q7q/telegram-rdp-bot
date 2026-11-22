@@ -1,0 +1,2 @@
+python-telegram-bot>=21.0
+simple-rdp==0.8.10
