@@ -1,0 +1,19 @@
+# Render free web services 15 min idle par sleep ho jate hain.
+# Ye workflow har 5 min service ki /health URL ko ping karta hai,
+# jiski wajah se service jaagti rehti hai aur Telegram bot 24/7 polling karta rahta hai.
+name: Keep Render service awake
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render health URL
+        run: |
+          echo "Pinging https://telegram-rdp-bot.onrender.com/health"
+          curl -s -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" --max-time 120 \
+            https://telegram-rdp-bot.onrender.com/health
