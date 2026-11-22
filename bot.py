@@ -8,6 +8,10 @@ from __future__ import annotations
 import functools
 import io
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 
 from telegram import Update
 from telegram.ext import (
@@ -236,9 +240,34 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"❌ Error: {e}")
 
 
+def start_health_server() -> None:
+    """Chhota sa HTTP server — health check / free-tier keep-alive ping ke liye.
+
+    Render free web services 15 min idle par sleep ho jate hain. UptimeRobot jaisi
+    free service is URL ko har 5 min ping karti hai, jisse service jaagti rehti hai.
+    """
+    port = int(os.environ.get("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (http.server API)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass  # shanti rakho
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server chal raha hai :%s par", port)
+
+
 def main() -> None:
     if not cfg["telegram_token"]:
         raise SystemExit("TELEGRAM_TOKEN missing — env me set karo")
+
+    start_health_server()
 
     app = Application.builder().token(cfg["telegram_token"]).build()
     app.add_handler(CommandHandler("start", cmd_start))
