@@ -1,5 +1,6 @@
 # Secrets — kabhi commit mat karna
 .env
+profiles.json
 
 # Python
 __pycache__/

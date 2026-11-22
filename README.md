@@ -65,7 +65,7 @@ after 15 minutes of inactivity.
 | Variable | Meaning |
 |---|---|
 | `TELEGRAM_TOKEN` | Token from BotFather (required) |
-| `RDP_HOST` | IP/hostname of the Windows machine (optional — `/connect` asks for it) |
+| `RDP_HOST` | IP/hostname of the Windows machine (optional — `/connect` asks for it, and `/add` saves profiles) |
 | `RDP_PORT` | default `3389` |
 | `RDP_USER` / `RDP_PASS` | Windows login (optional — `/connect` asks for it) |
 | `ALLOWED_USERS` | Only these Telegram IDs may control the bot (comma separated). Empty = allow everyone ⚠️ |
@@ -87,12 +87,22 @@ Then send `/start` to your bot, then `/connect` and follow the prompts.
 
 ## 📋 Commands
 
-**Connection / screen**
-- `/connect` — **step-by-step login**: the bot asks for IP → username → password
+**Connection / profiles (multiple RDPs)**
+- `/add RDP1 1.2.3.4:3389 user pass` — save a profile (host may include `:port`)
+- `/connect RDP1` — connect to a saved profile
+- `/connect` — **step-by-step login**: the bot asks for IP → username → password,
+  and saves it as the next free name (`RDP1`, `RDP2`, ...)
 - `/connect ip user pass` — or give everything at once
+- `/rdp RDP1` — switch the active profile (plain `/rdp1`, `rdp 1` also work)
+- `/list` — all profiles with active/connected status
+- `/remove RDP1` — delete a profile
 - `/cancel` — cancel the connect flow
 - `/disconnect`, `/status`
-- `/screen` — photo of the desktop (plain text `screen` works too)
+- `/screen` — photo of the active desktop (plain text `screen` works too)
+
+> Profiles are stored in `profiles.json` next to `bot.py` (gitignored — it holds
+> passwords). On Render's free tier the file is ephemeral, so profiles reset on
+> redeploy; re-add them with `/add`.
 
 **Search / apps / web**
 - `/win chrome` — open **Run (Win+R)** and search for an app or name.

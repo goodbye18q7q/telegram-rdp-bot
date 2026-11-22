@@ -1,12 +1,13 @@
-"""Telegram bot — controls a remote Windows machine over RDP.
+"""Telegram bot — controls remote Windows machines over RDP.
 
-Slash commands and plain text are turned into GUI actions and executed over RDP.
-Connection and screenshot commands (/connect, /disconnect, /status, /screen) live here.
+Supports multiple saved RDP profiles (RDP1, RDP2, ...). Every command acts on
+the ACTIVE profile; use /rdp <name> (or just /rdp1) to switch between them.
 """
 from __future__ import annotations
 
 import functools
 import io
+import json
 import logging
 import os
 import threading
@@ -35,27 +36,35 @@ logging.basicConfig(
 log = logging.getLogger("rdpbot")
 
 cfg = load_config()
-mgr = RDPManager(cfg)
 
+PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
+
+# name -> {"host": ..., "port": ..., "user": ..., "password": ...}
+profiles: dict[str, dict] = {}
+# The connection target every command acts on
+current: dict = {"name": None, "host": "", "port": 3389, "user": "", "password": ""}
+# One live RDP connection per profile
+managers: dict[str, RDPManager] = {}
 # chat_id -> {"step": "ip"|"user"|"pass", "host": ..., "port": ...}
-# Step-by-step /connect flow (IP, then username, then password)
 connect_sessions: dict[int, dict] = {}
 
-# Minimum fraction of changed pixels to call an app "opened"
 OPENED_RATIO = 0.15
 
-HELP_TEXT = """🤖 RDP Control Bot
+HELP_TEXT = """🤖 RDP Control Bot — multi profile
 
-🔌 Connection:
-/connect — step-by-step login (IP → username → password, one by one)
-          You can include the port too: IP:port (e.g. 1.2.3.4:65430)
-/connect ip user pass — or give everything at once
-/cancel — cancel the connect flow
-/disconnect — close the session
-/status — connection status
-/screen — photo of the desktop
+🔌 Profiles:
+/add RDP1 1.2.3.4:3389 user pass — save a profile (host may include :port)
+/connect RDP1                 — connect to a saved profile
+/connect                      — step by step (IP → username → password), saves as RDP1, RDP2...
+/rdp RDP1   or   /rdp1        — switch the active profile
+/list                         — all profiles (active + connected)
+/remove RDP1                  — delete a profile
+/disconnect                   — close the active connection
+/status                       — active profile + connection status
+/cancel                       — cancel the connect flow
+/screen                       — photo of the active desktop
 
-⌨️ Commands (slash and plain text both work):
+⌨️ Commands (they act on the ACTIVE profile):
 /win chrome — open Run (Win+R) and search for an app or name
 /ctrl hello — Ctrl+A then type text into the focused app
 /open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
@@ -71,8 +80,71 @@ HELP_TEXT = """🤖 RDP Control Bot
 /scroll down 3
 /seq win+r; type chrome; press enter; wait 2; type instagram.com; press enter
 
-Plain examples: "open chrome", "search instagram", "win chrome"
+Plain examples: "open chrome", "search instagram", "win chrome", "rdp2"
 """
+
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+
+def load_profiles() -> dict[str, dict]:
+    try:
+        with open(PROFILES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_profiles() -> None:
+    try:
+        with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+            json.dump(profiles, f, indent=2)
+    except Exception as e:
+        log.warning("could not save profiles: %s", e)
+
+
+def next_profile_name() -> str:
+    i = 1
+    while f"rdp{i}" in profiles:
+        i += 1
+    return f"rdp{i}"
+
+
+def profile_cfg(name: str) -> dict:
+    p = profiles.get(name, {})
+    c = dict(cfg)
+    c["rdp_host"] = p.get("host", "")
+    c["rdp_port"] = int(p.get("port", 3389))
+    c["rdp_user"] = p.get("user", "")
+    c["rdp_pass"] = p.get("password", "")
+    return c
+
+
+def mgr_key(name: str | None = None) -> str:
+    return (name or current["name"] or "adhoc").lower()
+
+
+def get_mgr(name: str | None = None) -> RDPManager:
+    """Return (creating if needed) the RDP manager for a profile."""
+    key = mgr_key(name)
+    mgr = managers.get(key)
+    if mgr is None:
+        if key == "adhoc" and not current["host"]:
+            raise ConnectionError("No RDP selected — use /add or /connect first")
+        mgr = RDPManager(profile_cfg(key) if key != "adhoc" else _adhoc_cfg())
+        managers[key] = mgr
+    return mgr
+
+
+def _adhoc_cfg() -> dict:
+    c = dict(cfg)
+    c["rdp_host"] = current["host"]
+    c["rdp_port"] = current["port"]
+    c["rdp_user"] = current["user"]
+    c["rdp_pass"] = current["password"]
+    return c
 
 
 def split_host_port(text: str, default_port: int = 3389) -> tuple[str, int]:
@@ -126,6 +198,10 @@ def start_health_server() -> None:
     log.info("Health server listening on :%s", port)
 
 
+# Load saved profiles at startup
+profiles = load_profiles()
+
+
 def guarded(handler):
     """Only ALLOWED_USERS may use the bot (empty = allow everyone, with a warning)."""
 
@@ -150,18 +226,91 @@ def guarded(handler):
     return wrapper
 
 
-@guarded
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
+# ---------------------------------------------------------------------------
+# Connection handlers
+# ---------------------------------------------------------------------------
 
-
-async def _do_connect(update: Update) -> None:
+async def _do_connect(update: Update, name: str | None = None) -> None:
     try:
+        mgr = get_mgr(name)
         await mgr.connect()
-        await update.message.reply_text(f"✅ Connected: {cfg['rdp_host']}:{cfg['rdp_port']}")
+        p = profiles.get(mgr_key(name), {})
+        host = p.get("host", current["host"])
+        port = p.get("port", current["port"])
+        await update.message.reply_text(f"✅ Connected: {mgr_key(name)} — {host}:{port}")
     except Exception as e:
         log.exception("connect failed")
         await update.message.reply_text(f"❌ Connection failed:\n{e}")
+
+
+@guarded
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save a profile: /add <name> <host[:port]> <user> <password>"""
+    args = context.args or []
+    if len(args) < 4:
+        await update.message.reply_text(
+            "Usage: /add <name> <host[:port]> <username> <password>\n"
+            "Example: /add RDP1 1.2.3.4:3389 Administrator MyPass"
+        )
+        return
+    name = args[0].lower()
+    host, port = split_host_port(args[1])
+    profiles[name] = {"host": host, "port": port, "user": args[2], "password": args[3]}
+    save_profiles()
+    await update.message.reply_text(f"💾 Saved profile: {name} — {host}:{port}\nConnect with /connect {name} or /rdp {name}")
+
+
+@guarded
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = (context.args or [""])[0].lower()
+    if name not in profiles:
+        await update.message.reply_text(f"Profile not found: {name}")
+        return
+    profiles.pop(name, None)
+    mgr = managers.pop(name, None)
+    if mgr is not None:
+        try:
+            await mgr.disconnect()
+        except Exception:
+            pass
+    if current["name"] == name:
+        current.update(name=None, host="", port=3389, user="", password="")
+    save_profiles()
+    await update.message.reply_text(f"🗑️ Removed profile: {name}")
+
+
+@guarded
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not profiles:
+        await update.message.reply_text("No profiles saved yet.\nUse /add <name> <host> <user> <pass>")
+        return
+    lines = []
+    for name in sorted(profiles):
+        p = profiles[name]
+        mgr = managers.get(name)
+        state = "🟢 connected" if (mgr and mgr.is_connected) else "⚪ offline"
+        marker = "👉 " if current["name"] == name else "   "
+        lines.append(f"{marker}{name} — {p.get('host')}:{p.get('port')} ({p.get('user')}) {state}")
+    await update.message.reply_text("\n".join(lines))
+
+
+@guarded
+async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rdp <name> — make a profile active and connect to it."""
+    name = (context.args or [""])[0].lower()
+    if name not in profiles:
+        await update.message.reply_text(
+            f"Profile not found: {name}\nSaved: {', '.join(sorted(profiles)) or 'none'}\nUse /add to save one."
+        )
+        return
+    current.update(
+        name=name,
+        host=profiles[name]["host"],
+        port=profiles[name]["port"],
+        user=profiles[name]["user"],
+        password=profiles[name]["password"],
+    )
+    await _do_connect(update, name)
 
 
 @guarded
@@ -169,24 +318,23 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = context.args or []
     chat_id = update.effective_chat.id
 
-    # Full credentials given at once: connect directly
+    # /connect <saved profile>
+    if len(args) == 1 and args[0].lower() in profiles:
+        await cmd_switch(update, context)
+        return
+
+    # /connect <host> <user> <pass> — one shot, saved as a new profile
     if len(args) >= 3:
         host, port = split_host_port(args[0])
-        cfg["rdp_host"] = host
-        cfg["rdp_user"] = args[1]
-        cfg["rdp_pass"] = args[2]
-        if len(args) >= 4:
-            try:
-                cfg["rdp_port"] = int(args[3])
-            except ValueError:
-                cfg["rdp_port"] = port
-        else:
-            cfg["rdp_port"] = port
+        name = next_profile_name()
+        profiles[name] = {"host": host, "port": port, "user": args[1], "password": args[2]}
+        save_profiles()
+        current.update(name=name, host=host, port=port, user=args[1], password=args[2])
         connect_sessions.pop(chat_id, None)
         await _do_connect(update)
         return
 
-    # Start the step-by-step flow
+    # Step-by-step flow
     session = {"step": "ip"}
     if len(args) == 1:
         host, port = split_host_port(args[0])
@@ -199,12 +347,6 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         session["port"] = port
         session["user"] = args[1]
         session["step"] = "pass"
-    elif cfg.get("rdp_host"):
-        # Host already set from env — no need to ask for it
-        host, port = split_host_port(cfg["rdp_host"])
-        session["host"] = host
-        session["port"] = port
-        session["step"] = "user"
 
     connect_sessions[chat_id] = session
 
@@ -242,12 +384,15 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
             "⚠️ The password will be saved in the chat history — delete this message after connecting."
         )
     else:
-        cfg["rdp_host"] = session.get("host") or cfg["rdp_host"]
-        cfg["rdp_port"] = session.get("port", cfg["rdp_port"])
-        cfg["rdp_user"] = session.get("user", "")
-        cfg["rdp_pass"] = text
+        host = session.get("host", "")
+        port = session.get("port", 3389)
+        name = next_profile_name()
+        profiles[name] = {"host": host, "port": port, "user": session.get("user", ""), "password": text}
+        save_profiles()
+        current.update(name=name, host=host, port=port, user=session.get("user", ""), password=text)
         connect_sessions.pop(chat_id, None)
         await _do_connect(update)
+        await update.message.reply_text(f"💾 Saved as profile: {name} — switch anytime with /rdp {name}")
 
 
 @guarded
@@ -261,29 +406,43 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @guarded
 async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await mgr.disconnect()
-    await update.message.reply_text("🔌 Disconnected.")
+    try:
+        await get_mgr().disconnect()
+        await update.message.reply_text(f"🔌 Disconnected from {mgr_key()}.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
 
 
 @guarded
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(mgr.status_text())
+    if not current["name"] and not current["host"]:
+        await update.message.reply_text("No RDP selected. Use /connect or /rdp <name>.")
+        return
+    mgr = managers.get(mgr_key())
+    state = "🟢 connected" if (mgr and mgr.is_connected) else "🔴 disconnected"
+    await update.message.reply_text(
+        f"👉 Active: {mgr_key()} — {current['host']}:{current['port']} ({current['user']}) {state}"
+    )
 
 
 @guarded
 async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        img = await mgr.screenshot()
+        img = await get_mgr().screenshot()
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
         await update.message.reply_photo(
-            photo=buf, caption=f"🖥 {cfg['rdp_host']} ({img.width}x{img.height})"
+            photo=buf, caption=f"🖥 {mgr_key()} — {current['host']} ({img.width}x{img.height})"
         )
     except Exception as e:
         log.exception("screenshot failed")
         await update.message.reply_text(f"❌ Screenshot failed: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Command handlers (act on the ACTIVE profile)
+# ---------------------------------------------------------------------------
 
 async def _win_flow(update: Update, word: str) -> None:
     """Win+R + type a word + Enter, then report Opened / Not found."""
@@ -291,7 +450,7 @@ async def _win_flow(update: Update, word: str) -> None:
         await update.message.reply_text("Not found: no search word given (/win <word>)")
         return
     try:
-        # Open Run and type the word (no Enter yet)
+        mgr = get_mgr()
         await mgr.execute(commands.a_win_search(word))
         before = await mgr.screenshot()
         await mgr.execute([("key", "enter"), ("wait", 1.8)])
@@ -320,7 +479,7 @@ async def _ctrl_flow(update: Update, word: str) -> None:
         await update.message.reply_text("Usage: /ctrl <text>")
         return
     try:
-        await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("text", word)])
+        await get_mgr().execute([("key", "ctrl+a"), ("wait", 0.2), ("text", word)])
         await update.message.reply_text(f"Typed: {word}")
     except Exception as e:
         log.exception("ctrl type failed")
@@ -338,7 +497,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     text = update.message.text.strip()
 
-    # /win and /ctrl step-by-step flows
+    # /connect step-by-step flow
     session = connect_sessions.get(update.effective_chat.id)
     if session:
         return await _handle_connect_step(update, session)
@@ -349,15 +508,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if low in ("screen", "screenshot", "photo", "desktop photo"):
         return await cmd_screen(update, context)
     if low in ("connect", "login"):
+        context.args = []
         return await cmd_connect(update, context)
     if low in ("disconnect", "logout"):
         return await cmd_disconnect(update, context)
     if low in ("status",):
         return await cmd_status(update, context)
+    if low in ("list", "profiles"):
+        return await cmd_list(update, context)
     if low == "win" or low.startswith("win "):
         return await _win_flow(update, text[3:].strip())
     if low == "ctrl" or low.startswith("ctrl "):
         return await _ctrl_flow(update, text[4:].strip())
+
+    # Profile switching: "rdp2", "rdp 2", "rdp rdp2", "/rdp2"
+    sw = low[1:] if low.startswith("/") else low
+    if sw.startswith("rdp"):
+        rest = sw[3:].strip()
+        if rest.isdigit():
+            rest = f"rdp{rest}"
+        if rest:
+            context.args = [rest]
+            return await cmd_switch(update, context)
 
     try:
         actions, desc = commands.parse_command(text)
@@ -366,7 +538,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        await mgr.execute(actions)
+        await get_mgr().execute(actions)
         await update.message.reply_text(f"✅ {desc}")
     except Exception as e:
         log.exception("execute failed")
@@ -382,6 +554,10 @@ def main() -> None:
     app = Application.builder().token(cfg["telegram_token"]).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("rdp", cmd_switch))
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
@@ -389,13 +565,13 @@ def main() -> None:
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("ctrl", cmd_ctrl))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.TEXT, on_message))
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Unhandled error: %s", context.error, exc_info=context.error)
 
     app.add_error_handler(on_error)
-    log.info("Bot is starting...")
+    log.info("Bot is starting... profiles: %s", sorted(profiles))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
