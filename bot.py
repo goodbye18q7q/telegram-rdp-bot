@@ -73,6 +73,8 @@ def guarded(handler):
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else 0
+        uname = update.effective_user.username if update.effective_user else None
+        log.info("Message aaya: user id=%s username=%s chat=%s", uid, uname, update.effective_chat.id if update.effective_chat else None)
         if not cfg["allowed_users"]:
             log.warning("ALLOWED_USERS set nahi hai — sab users allow hain!")
         elif uid not in cfg["allowed_users"]:
