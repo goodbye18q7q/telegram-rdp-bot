@@ -932,10 +932,28 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                 log.info("Trying simple-rdp fallback method %s for %r", method, word)
                 base = desktop_simple
                 if method == "win+r":
-                    # Direct Win+R
+                    # Open Run and type the command. Explicitly submit it; some RemoteApp
+                    # clients leave focus in the edit box and ignore the first Enter.
                     await mgr.execute([("key", "win+r"), ("wait", 1.2)])
                     await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
-                    await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
+                    await mgr.execute([("text", word), ("wait", 0.5)])
+                    typed_img = await mgr.screenshot_nowait()
+                    await mgr.execute([("key", "enter"), ("wait", 2.5)])
+                    after_img = await mgr.screenshot_nowait()
+                    # If Run is still showing the exact typed command, activate its
+                    # OK/Open button explicitly. Alt+O is the dialog accelerator;
+                    # two Tabs also move from the edit box through Browse to OK.
+                    if diff_ratio(typed_img, after_img) < 0.01:
+                        log.info("Run dialog unchanged after Enter for %r; trying Alt+O", word)
+                        await mgr.execute([("key", "alt+o"), ("wait", 3.0)])
+                        after_img = await mgr.screenshot_nowait()
+                    if diff_ratio(typed_img, after_img) < 0.01:
+                        log.info("Run dialog unchanged after Alt+O for %r; trying Tab+Tab+Enter", word)
+                        await mgr.execute([("key", "tab"), ("wait", 0.15), ("key", "tab"), ("wait", 0.15), ("key", "enter"), ("wait", 3.0)])
+                        after_img = await mgr.screenshot_nowait()
+                    if diff_ratio(typed_img, after_img) < 0.01:
+                        log.info("Run dialog still open for %r; not reporting success", word)
+                        continue
                 else:
                     # Start -> Run
                     await mgr.execute([("key", "ctrl+esc"), ("wait", 0.8)])
@@ -943,7 +961,7 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                     await mgr.execute([("text", "Run"), ("wait", 0.5), ("key", "enter"), ("wait", 1.5)])
                     await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
                     await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
-                after_img = await mgr.screenshot()
+                    after_img = await mgr.screenshot_nowait()
                 r = diff_ratio(base, after_img)
                 from PIL import ImageChops, ImageOps
                 a = ImageOps.grayscale(base); b = ImageOps.grayscale(after_img)
@@ -1124,14 +1142,9 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                 log.warning("freerdp fallback import all tries failed")
         except Exception as e:
             log.warning("freerdp fallback import compare fail: %s", e)
-        # Try to close the opened app / error dialog to leave desktop clean
-        try:
-            subprocess.run(["xdotool", "key", "Alt+F4"], env=env, timeout=5)
-            await asyncio.sleep(0.8)
-            subprocess.run(["xdotool", "key", "Escape"], env=env, timeout=5)
-            await asyncio.sleep(0.5)
-        except Exception:
-            pass
+        # Do NOT Alt+F4 here: that used to close the application immediately after
+        # launching it, so /screen showed only the desktop. Let the app remain open;
+        # terminating the RDP client below disconnects the viewer without closing it.
     except Exception as e:
         log.warning("FreeRDP fallback error: %s", e)
         return None
