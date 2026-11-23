@@ -920,35 +920,40 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             freerdps = glob.glob("/usr/bin/*freerdp*")
             log.warning("glob /usr/bin/*freerdp*: %s", freerdps)
         except: pass
-        # Fallback without FreeRDP: try simple-rdp Run via Start menu search for 'Run' app
-        # This works on tally even when Win+R blocked, because we use ctrl+esc -> type 'Run'
-        try:
-            log.info("Trying simple-rdp Run fallback for %r", word)
-            # Take base screenshot
-            base = desktop
-            # Open Start -> type Run -> Enter (opens Run dialog)
-            await mgr.execute([("key", "ctrl+esc"), ("wait", 0.8)])
-            await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
-            await mgr.execute([("text", "Run"), ("wait", 0.5), ("key", "enter"), ("wait", 1.5)])
-            # Now Run dialog should be open -> type app and enter
-            await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
-            await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
-            # Screenshot after
-            after_img = await mgr.screenshot()
-            r = diff_ratio(base, after_img)
-            from PIL import ImageChops, ImageOps
-            a = ImageOps.grayscale(base); b = ImageOps.grayscale(after_img)
-            if a.size != b.size: b = b.resize(a.size)
-            hist = ImageChops.difference(a,b).histogram()
-            r10 = sum(hist[10:])/(a.size[0]*a.size[1]) if a.size[0]*a.size[1] else 0
-            log.info("simple Run fallback %r -> diff %.3f thr10 %.3f", word, r, r10)
-            if r > 0.02 or r10 > 0.03:
-                return f"Opened: {word}"
-            else:
-                return f"Not found: {word}"
-        except Exception as e:
-            log.warning("simple Run fallback failed: %s", e)
-        return None
+        # Fallback without FreeRDP: try simple-rdp methods (Win+R and Run app)
+        # Try 1: Win+R via simple-rdp (may work even when Start blocked)
+        # Try 2: Start -> Run app
+        for method in ["win+r", "run"]:
+            try:
+                log.info("Trying simple-rdp fallback method %s for %r", method, word)
+                base = desktop
+                if method == "win+r":
+                    # Direct Win+R
+                    await mgr.execute([("key", "win+r"), ("wait", 1.2)])
+                    await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+                    await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
+                else:
+                    # Start -> Run
+                    await mgr.execute([("key", "ctrl+esc"), ("wait", 0.8)])
+                    await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+                    await mgr.execute([("text", "Run"), ("wait", 0.5), ("key", "enter"), ("wait", 1.5)])
+                    await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+                    await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
+                after_img = await mgr.screenshot()
+                r = diff_ratio(base, after_img)
+                from PIL import ImageChops, ImageOps
+                a = ImageOps.grayscale(base); b = ImageOps.grayscale(after_img)
+                if a.size != b.size: b = b.resize(a.size)
+                hist = ImageChops.difference(a,b).histogram()
+                r10 = sum(hist[10:])/(a.size[0]*a.size[1]) if a.size[0]*a.size[1] else 0
+                log.info("simple fallback %s %r -> diff %.3f thr10 %.3f", method, word, r, r10)
+                if r > 0.02 or r10 > 0.03:
+                    return f"Opened: {word}"
+                # if not opened, try next method
+            except Exception as e:
+                log.warning("simple fallback %s failed: %s", method, e)
+                continue
+        return f"Not found: {word}" if method == "run" else None
     if not await _ensure_xvfb():
         return None
     cfg = mgr.cfg
@@ -1208,13 +1213,21 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         mgr = get_mgr()
-        # This server (103.76.214.2) is RemoteApp — Start menu blocked, direct Run is fastest
-        log.info("cmd_run %r via FreeRDP", word)
+        log.info("cmd_run %r via FreeRDP/simple", word)
         fb = await _win_via_freerdp(mgr, word)
         if fb is not None:
+            # fb already is Opened/Not found via Run dialog (FreeRDP or simple fallback)
             await update.message.reply_text(fb + " (via Run dialog)")
-        else:
-            await update.message.reply_text("❌ Run fallback available nahi hai (xvfb/xfreerdp missing). /win try karo.")
+            return
+        # Last resort: try simple-rdp direct open (no FreeRDP) — works for many apps
+        try:
+            await mgr.execute(commands.a_open_app(word) + [("wait", 2.0)])
+            await asyncio.sleep(1.2)
+            # check via screenshot diff
+            # we don't have base, so just reply generic
+            await update.message.reply_text(f"✅ Trying to open: {word} — /screen bhejo check karo")
+        except Exception as e2:
+            await update.message.reply_text(f"❌ Open failed: {e2}")
     except Exception as e:
         log.exception("run failed")
         await update.message.reply_text(f"Error: {e}")
