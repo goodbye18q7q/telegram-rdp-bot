@@ -269,25 +269,44 @@ class TestWinCtrl(BotTestCase):
         self.assertIn("Not found", msg.reply_text.await_args[0][0])
 
     def test_win_opened(self):
+        # desktop(black) -> dialog(gray) -> app(white)
         self.use_fake()
         fake = bot.get_mgr()
         update, msg = make_update("/win chrome")
         ctx = MagicMock()
         ctx.args = ["chrome"]
-        fake.screenshot = AsyncMock(side_effect=[self.img((0, 0, 0)), self.img((255, 255, 255))])
+        fake.screenshot = AsyncMock(
+            side_effect=[self.img((0, 0, 0)), self.img((80, 80, 80)), self.img((255, 255, 255))]
+        )
         asyncio.run(bot.cmd_win(update, ctx))
         self.assertIn("Opened", msg.reply_text.await_args[0][0])
 
     def test_win_not_found(self):
+        # dialog khulta hai par app nahi — screen wapas desktop jaisi
         self.use_fake()
         fake = bot.get_mgr()
         update, msg = make_update("/win zzznotanapp")
         ctx = MagicMock()
         ctx.args = ["zzznotanapp"]
-        same = self.img((10, 10, 10))
-        fake.screenshot = AsyncMock(side_effect=[same, same])
+        desktop = self.img((0, 0, 0))
+        fake.screenshot = AsyncMock(
+            side_effect=[desktop, self.img((80, 80, 80)), desktop]
+        )
         asyncio.run(bot.cmd_win(update, ctx))
         self.assertIn("Not found", msg.reply_text.await_args[0][0])
+
+    def test_win_dialog_did_not_open(self):
+        self.use_fake()
+        fake = bot.get_mgr()
+        update, msg = make_update("/win chrome")
+        ctx = MagicMock()
+        ctx.args = ["chrome"]
+        same = self.img((10, 10, 10))
+        fake.screenshot = AsyncMock(side_effect=[same, same, same])
+        asyncio.run(bot.cmd_win(update, ctx))
+        text = msg.reply_text.await_args[0][0]
+        self.assertIn("Run dialog", text)
+        self.assertNotIn("Opened", text)
 
     def test_ctrl(self):
         fake = self.use_fake()

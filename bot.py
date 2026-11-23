@@ -177,6 +177,15 @@ def diff_ratio(img_a, img_b) -> float:
     return sum(hist[40:]) / total if total else 0.0
 
 
+def mean_brightness(img) -> float:
+    """0..255 — 0 ka matlab screen bilkul black (diagnostic ke liye)."""
+    hist = ImageOps.grayscale(img).histogram()
+    total = sum(hist)
+    if not total:
+        return 0.0
+    return sum(i * c for i, c in enumerate(hist)) / total
+
+
 def start_health_server() -> None:
     """Tiny HTTP server — health check / free-tier keep-alive ping.
 
@@ -448,6 +457,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         img = await get_mgr().screenshot()
+        log.info(
+            "screenshot %s -> %dx%d, brightness %.0f",
+            mgr_key(),
+            img.width,
+            img.height,
+            mean_brightness(img),
+        )
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
@@ -464,21 +480,34 @@ async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ---------------------------------------------------------------------------
 
 async def _win_flow(update: Update, word: str) -> None:
-    """Win+R + type a word + Enter, then report Opened / Not found."""
+    """Win+R + clear + type + Enter, then report Opened / Not found."""
     if not word:
         await update.message.reply_text("Not found: no search word given (/win <word>)")
         return
     try:
         mgr = get_mgr()
-        await mgr.execute(commands.a_win_search(word))
-        before = await mgr.screenshot()
+        desktop = await mgr.screenshot()               # Run box se pehle
+        await mgr.execute(commands.a_win_search(word))  # Win+R + clear + type
+        dialog = await mgr.screenshot()                 # Run box khula hua
         await mgr.execute([("key", "enter"), ("wait", 1.8)])
         after = await mgr.screenshot()
 
-        ratio = diff_ratio(before, after)
-        log.info("win search %r -> changed ratio %.3f", word, ratio)
+        r_dialog = diff_ratio(desktop, dialog)
+        r_after = diff_ratio(desktop, after)
+        log.info(
+            "win %r -> dialog %.3f, after %.3f, brightness %.0f",
+            word,
+            r_dialog,
+            r_after,
+            mean_brightness(after),
+        )
 
-        if ratio >= OPENED_RATIO:
+        if r_dialog < 0.005:
+            await update.message.reply_text(
+                f"⚠️ Run dialog nahi khula (screen change {r_dialog:.3f}).\n"
+                f"/screen bhej kar desktop check karo."
+            )
+        elif r_after >= OPENED_RATIO:
             await update.message.reply_text(f"Opened: {word}")
         else:
             await update.message.reply_text(f"Not found: {word}")
