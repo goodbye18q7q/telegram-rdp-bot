@@ -29,9 +29,12 @@ logging.basicConfig(
 
 from PIL import ImageChops
 from PIL import ImageOps
+from telegram import InlineKeyboardButton
+from telegram import InlineKeyboardMarkup
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -56,6 +59,8 @@ current: dict = {"name": None, "host": "", "port": 3389, "user": "", "password":
 managers: dict[str, RDPManager] = {}
 # chat_id -> {"step": "ip"|"user"|"pass", "host": ..., "port": ...}
 connect_sessions: dict[int, dict] = {}
+# chat_id -> [(title, url), ...] last search results
+search_sessions: dict[int, list[tuple[str, str]]] = {}
 
 OPENED_RATIO = 0.05
 FREERDP_LOCK = asyncio.Lock()
@@ -83,8 +88,9 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /edge                         — open Microsoft Edge
 /open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
 /open instagram — open a website
-/search instagram — Google search in Chrome
-/goto instagram.com — open a URL
+/search wallpaper 4k — search + numbered list (1,2,3...) → reply 1 to open
+/search instagram — shows 1) insta 2) etc → tap 1 to open in RDP Chrome
+/goto instagram.com — open a URL directly
 /instagram — open Instagram directly
 /install adblock — open the Chrome Web Store
 /cmd ipconfig — run a command in PowerShell
@@ -211,6 +217,95 @@ def mean_brightness(img) -> float:
     if not total:
         return 0.0
     return sum(i * c for i, c in enumerate(hist)) / total
+
+
+def fetch_search_results(query: str, count: int = 5) -> list[tuple[str, str]]:
+    """DuckDuckGo HTML se top results — 1,2,3 selection ke liye."""
+    import html as htmlmod
+    import re
+    import urllib.parse
+    import urllib.request
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://html.duckduckgo.com/html/?q={q}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        data = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", errors="ignore")
+        # DuckDuckGo result__url and result__title
+        titles = re.findall(r'class="result__title".*?<a[^>]*>(.*?)</a>', data, re.S)
+        hrefs = re.findall(r'class="result__url"[^>]*href="([^"]+)"', data)
+        # fallback hrefs from result__a
+        if not hrefs:
+            hrefs = re.findall(r'class="result__a"[^>]*href="([^"]+)"', data)
+        results = []
+        for i in range(min(len(titles), len(hrefs), count)):
+            title = re.sub(r"<.*?>", "", titles[i]).strip()
+            title = htmlmod.unescape(title) or query
+            href = hrefs[i].strip()
+            # DuckDuckGo wraps with /l/?kh=...&uddg=https://...
+            if "uddg=" in href:
+                try:
+                    href = urllib.parse.unquote(href.split("uddg=")[1].split("&")[0])
+                except: pass
+            if href.startswith("//"):
+                href = "https:" + href
+            if not href.startswith("http"):
+                href = "https://" + href
+            results.append((title[:70], href))
+        if results:
+            return results
+    except Exception as e:
+        log.warning("search fetch fail %r: %s", query, e)
+    # Known sites direct — instagram etc ke liye seedha link
+    low = query.lower().strip()
+    try:
+        from commands import WEB_ALIASES
+        if low in WEB_ALIASES:
+            import urllib.parse as up2
+            q = up2.quote(query)
+            return [
+                (low.title(), WEB_ALIASES[low]),
+                (f"Google: {query}", f"https://www.google.com/search?q={q}"),
+                (f"Bing: {query}", f"https://www.bing.com/search?q={q}"),
+            ]
+    except: pass
+    # fallback: direct google search url + bing
+    import urllib.parse as up
+    q = up.quote(query)
+    return [
+        (f"Google: {query}", f"https://www.google.com/search?q={q}"),
+        (f"Bing: {query}", f"https://www.bing.com/search?q={q}"),
+        (f"DuckDuckGo: {query}", f"https://duckduckgo.com/?q={q}"),
+    ]
+
+
+BROWSER_CANDIDATES = [
+    "chrome",
+    "chrome.exe",
+    "msedge",
+    "msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "iexplore",
+    "firefox",
+]
+
+
+async def _open_browser_via_run(mgr, url: str | None = None) -> str | None:
+    """Tally RemoteApp pe chrome kholne ka robust tareeka — multiple candidates try."""
+    # url None -> blank chrome, else specific url
+    for cand in BROWSER_CANDIDATES:
+        app = cand if url is None else f'{cand} {url}' if "://" not in cand else cand
+        # For path with spaces, need quotes
+        if url and " " in cand:
+            app = f'"{cand}" {url}'
+        log.info("try browser candidate %r", app)
+        res = await _win_via_freerdp(mgr, app)
+        if res and "Opened" in res:
+            return res
+        # also try simple execute fallback for that candidate (if not FreeRDP)
+        await asyncio.sleep(0.8)
+    return None
 
 
 UI_HTML = r"""<!doctype html>
@@ -497,10 +592,26 @@ async def _do_connect(update: Update, name: str | None = None) -> None:
         host = p.get("host", current["host"])
         port = p.get("port", current["port"])
         await update.message.reply_text(f"✅ Connected: {key} — {host}:{port}")
+        # Tally RemoteApp (103.76...) pe connect hote hi chrome auto kholne ki koshish
+        if host == "103.76.214.2" and str(port) == "65430":
+            await update.message.reply_text("🔄 Tally RDP — chrome auto-open try kar raha hu...")
+            asyncio.create_task(_auto_chrome_for_tally(key))
     except Exception as e:
         log.exception("connect failed")
         await update.message.reply_text(f"❌ Connection failed:\n{e}")
 
+
+
+async def _auto_chrome_for_tally(key: str):
+    await asyncio.sleep(2.5)
+    try:
+        mgr = managers.get(key)
+        if not mgr or not mgr.is_connected:
+            return
+        res = await _open_browser_via_run(mgr, "https://www.google.com")
+        log.info("auto chrome for %s: %s", key, res)
+    except Exception as e:
+        log.warning("auto chrome failed %s: %s", key, e)
 
 @guarded
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1054,6 +1165,86 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @guarded
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search in Chrome with numbered selection: /search wallpaper 4k, /search instagram"""
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text("Kya search karna hai? e.g. /search wallpaper 4k  ya  /search instagram")
+        return
+    chat_id = update.effective_chat.id
+    try:
+        await update.message.reply_text(f"🔍 Searching: {query}...")
+        # Fetch results via DuckDuckGo (numbered)
+        results = await asyncio.to_thread(fetch_search_results, query, 5)
+        search_sessions[chat_id] = results
+        # Build message
+        lines = [f"🔍 *{query}* — select karo (1-{len(results)}):\n"]
+        for i, (title, url) in enumerate(results, 1):
+            # shorten url
+            disp = url[:55] + ("..." if len(url) > 55 else "")
+            lines.append(f"*{i}.* {title}\n   {disp}\n")
+        lines.append("\nReply with number `1`, `2`... ya button dabao — RDP ke Chrome me khulega.")
+        # Inline keyboard 1-5 + Open Google
+        buttons = []
+        row = []
+        for i in range(1, len(results)+1):
+            row.append(InlineKeyboardButton(str(i), callback_data=f"search:{i}"))
+            if len(row) == 3:
+                buttons.append(row); row=[]
+        if row: buttons.append(row)
+        # Add direct open google search as fallback (especially for tally where results may not open)
+        buttons.append([InlineKeyboardButton("🔎 Open Google Search", callback_data="search:0")])
+        markup = InlineKeyboardMarkup(buttons)
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        log.exception("search failed")
+        await update.message.reply_text(f"❌ Search failed: {e}")
+
+
+async def on_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    chat_id = update.effective_chat.id
+    results = search_sessions.get(chat_id, [])
+    try:
+        if data == "search:0":
+            # open google search directly
+            # need original query — reconstruct from last search? For now open google.com
+            # Find last query from results title?
+            # Use first result's google url if available, else google
+            url = results[0][1] if results and "google.com/search" in results[0][1] else "https://www.google.com"
+            # If results empty, try to get query from message text
+            # Fallback: open google
+        else:
+            idx = int(data.split(":")[1]) - 1
+            if idx < 0 or idx >= len(results):
+                await query.edit_message_text("❌ Invalid selection")
+                return
+            title, url = results[idx]
+        mgr = get_mgr()
+        await query.edit_message_text(f"⏳ Opening in RDP: {url[:80]}...")
+        # Robust open: try browser candidates with url
+        # Use _open_browser_via_run if tally, else simple goto
+        host = current.get("host","")
+        if host == "103.76.214.2":
+            res = await _open_browser_via_run(mgr, url)
+            if res:
+                await query.message.reply_text(res + f" — {url}")
+            else:
+                # fallback to simple goto via chrome
+                await mgr.execute(commands.a_goto(url))
+                await query.message.reply_text(f"✅ Opening: {url}")
+        else:
+            await mgr.execute(commands.a_goto(url))
+            await query.message.reply_text(f"✅ Opening: {url}\n/screen bhejo dekho")
+    except Exception as e:
+        log.exception("search callback failed")
+        try: await query.message.reply_text(f"❌ Error: {e}")
+        except: pass
+
+
+@guarded
 async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Black screen fix: disconnect + reconnect"""
     try:
@@ -1145,6 +1336,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return await cmd_run(update, context)
     if low == "ctrl" or low.startswith("ctrl "):
         return await _ctrl_flow(update, text[4:].strip())
+    if low.startswith("search ") or low == "search":
+        q = text[6:].strip() if low.startswith("search ") else ""
+        context.args = q.split() if q else []
+        return await cmd_search(update, context)
+    # Numbered search selection: user replies "1" or "2" after /search
+    if low.isdigit() and update.effective_chat.id in search_sessions:
+        results = search_sessions[update.effective_chat.id]
+        idx = int(low) - 1
+        if 0 <= idx < len(results):
+            title, url = results[idx]
+            try:
+                mgr = get_mgr()
+                await update.message.reply_text(f"⏳ Opening {idx+1}: {title}\n{url}")
+                host = current.get("host","")
+                if host == "103.76.214.2":
+                    res = await _open_browser_via_run(mgr, url)
+                    if not res or "Not found" in res:
+                        await mgr.execute(commands.a_goto(url))
+                else:
+                    await mgr.execute(commands.a_goto(url))
+                await update.message.reply_text(f"✅ Opened: {title}")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error: {e}")
+            return
 
     # Profile switching: "rdp2", "rdp 2", "/rdp2", "switch1", "switch 2", "/switch1"
     sw = low[1:] if low.startswith("/") else low
@@ -1193,11 +1408,13 @@ def main() -> None:
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("ui", cmd_ui))
     app.add_handler(CommandHandler("keyboard", cmd_ui))
     app.add_handler(CommandHandler("mouse", cmd_ui))
     app.add_handler(CommandHandler("ctrl", cmd_ctrl))
+    app.add_handler(CallbackQueryHandler(on_search_callback, pattern=r"^search:"))
     app.add_handler(MessageHandler(filters.TEXT, on_message))
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
