@@ -932,24 +932,31 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                 log.info("Trying simple-rdp fallback method %s for %r", method, word)
                 base = desktop_simple
                 if method == "win+r":
-                    # Open Run and type the command. Explicitly submit it; some RemoteApp
-                    # clients leave focus in the edit box and ignore the first Enter.
+                    # First verify Win+R actually opened a dialog. On RemoteApp hosts
+                    # the shortcut can be swallowed; never type/click into the app behind it.
                     await mgr.execute([("key", "win+r"), ("wait", 1.2)])
+                    run_img = await mgr.screenshot_nowait()
+                    run_diff = diff_ratio(base, run_img)
+                    log.info("Run dialog probe for %r -> diff %.3f", word, run_diff)
+                    if run_diff < 0.025:
+                        log.info("Run dialog did not appear for %r; skip typing/click", word)
+                        continue
                     await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
                     await mgr.execute([("text", word), ("wait", 0.5)])
                     typed_img = await mgr.screenshot_nowait()
-                    await mgr.execute([("key", "enter"), ("wait", 2.5)])
+                    # Try Enter, then physically click the Run dialog's OK button.
+                    # Mouse clicks work on this RemoteApp host while Enter is swallowed.
+                    await mgr.execute([("key", "enter"), ("wait", 2.0)])
                     after_img = await mgr.screenshot_nowait()
-                    # If Run is still showing the exact typed command, activate its
-                    # OK/Open button explicitly. Alt+O is the dialog accelerator;
-                    # two Tabs also move from the edit box through Browse to OK.
                     if diff_ratio(typed_img, after_img) < 0.01:
-                        log.info("Run dialog unchanged after Enter for %r; trying Alt+O", word)
-                        await mgr.execute([("key", "alt+o"), ("wait", 3.0)])
+                        sw, sh = mgr.client.width, mgr.client.height
+                        ok_x, ok_y = int(sw * 0.43), int(sh * 0.57)
+                        log.info("Run dialog unchanged after Enter for %r; clicking OK at %d,%d (%dx%d)", word, ok_x, ok_y, sw, sh)
+                        await mgr.execute([("click", ok_x, ok_y, 1, False), ("wait", 4.0)])
                         after_img = await mgr.screenshot_nowait()
                     if diff_ratio(typed_img, after_img) < 0.01:
-                        log.info("Run dialog unchanged after Alt+O for %r; trying Tab+Tab+Enter", word)
-                        await mgr.execute([("key", "tab"), ("wait", 0.15), ("key", "tab"), ("wait", 0.15), ("key", "enter"), ("wait", 3.0)])
+                        log.info("Run dialog still open after button click for %r; trying Alt+O", word)
+                        await mgr.execute([("key", "alt+o"), ("wait", 3.0)])
                         after_img = await mgr.screenshot_nowait()
                     if diff_ratio(typed_img, after_img) < 0.01:
                         log.info("Run dialog still open for %r; not reporting success", word)
