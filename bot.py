@@ -5,6 +5,7 @@ the ACTIVE profile; use /rdp <name> (or just /rdp1) to switch between them.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import io
 import json
@@ -527,19 +528,34 @@ async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ---------------------------------------------------------------------------
 
 async def _win_flow(update: Update, word: str) -> None:
-    """Win+R + clear + type + Enter, then report Opened / Not found."""
+    """Start menu me type karke app kholna, phir Opened / Not found report.
+
+    Server par Windows key kaam nahi karta (blocked), isliye Win+R ki jagah
+    ctrl+esc se Start menu khulta hai aur usme app ka naam type hota hai.
+    """
     if not word:
         await update.message.reply_text("Not found: no search word given (/win <word>)")
         return
     try:
         mgr = get_mgr()
-        desktop = await mgr.screenshot()               # Run box se pehle
-        await mgr.execute(commands.a_win_search(word))  # Win+R + clear + type
-        dialog = await mgr.screenshot()                 # Run box khula hua
-        await mgr.execute([("key", "enter"), ("wait", 1.8)])
+        desktop = await mgr.screenshot()               # menu se pehle
+        dialog = desktop
+        r_dialog = 0.0
+
+        # Start menu kabhi-kabhi nahi khulta / turant band ho jata hai — retry.
+        for attempt in range(1, 4):
+            await mgr.execute(commands.a_win_search(word))
+            dialog = await mgr.screenshot()
+            r_dialog = diff_ratio(desktop, dialog)
+            if r_dialog >= 0.01:
+                break
+            log.info("win %r: Start menu nahi khula (%.3f), retry %d", word, r_dialog, attempt)
+            await mgr.execute([("key", "escape"), ("wait", 0.8)])
+            await asyncio.sleep(0.5)
+
+        await mgr.execute([("key", "enter"), ("wait", 2.5)])
         after = await mgr.screenshot()
 
-        r_dialog = diff_ratio(desktop, dialog)
         r_after = diff_ratio(desktop, after)
         log.info(
             "win %r -> dialog %.3f, after %.3f, brightness %.0f",
@@ -551,7 +567,7 @@ async def _win_flow(update: Update, word: str) -> None:
 
         if r_dialog < 0.005:
             await update.message.reply_text(
-                f"⚠️ Run dialog nahi khula (screen change {r_dialog:.3f}).\n"
+                f"⚠️ Start menu nahi khula (screen change {r_dialog:.3f}).\n"
                 f"/screen bhej kar desktop check karo."
             )
         elif r_after >= OPENED_RATIO:

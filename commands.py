@@ -24,7 +24,7 @@ def _clear_field() -> list:
 def a_open_app(app: str) -> list:
     """Open an app through the Windows Run dialog (Win+R)."""
     return [
-        ("key", "win+r"),
+        ("key", "ctrl+esc"),
         ("wait", 0.6),
         *_clear_field(),
         ("text", app),
@@ -41,11 +41,11 @@ def a_win_search(word: str) -> list:
     whether the app was found ("opened") or not ("not found").
     """
     return [
-        ("key", "win+r"),
-        ("wait", 0.6),
+        ("key", "ctrl+esc"),
+        ("wait", 1.0),
         *_clear_field(),
         ("text", word),
-        ("wait", 0.4),
+        ("wait", 0.8),
     ]
 
 

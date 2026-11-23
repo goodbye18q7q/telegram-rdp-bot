@@ -149,6 +149,14 @@ Parser + action engine + handler wiring unit tests (no real RDP server needed).
 - **Wrong click coordinates** → get the right (x, y) from `/screen` (screen is 1366×768 by default).
 - **`Not found` for a real app** → the detection compares screenshots; a very small window
   can look like "no change". Use `/open <app>` for a guaranteed launch.
+- **Screen is black in `/screen`** → the bot always connects with `show_wallpaper=True`.
+  simple-rdp's default (`False`) sends `PERF_DISABLE_WALLPAPER`, and some servers then
+  render a solid black desktop instead of the real one.
+- **Windows key does nothing** → many hosted/kiosk RDP setups block the Win key. `/win`
+  therefore opens the Start menu with `ctrl+esc` and types the app name there (it also
+  retries a few times if the menu does not appear).
+- **Login fails after a few tries** → the server may rate-limit new connections; wait a
+  few seconds and run `/connect` again (every `/connect` is a fresh connection).
 
 ## ⚠️ Disclaimer
 

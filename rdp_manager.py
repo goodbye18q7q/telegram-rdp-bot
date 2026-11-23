@@ -14,7 +14,17 @@ rdp_patch.apply()
 
 log = logging.getLogger(__name__)
 
+
+def _brightness(img) -> float:
+    """PIL image ki average brightness (0-255)."""
+    h = img.convert("L").histogram()
+    total = sum(h)
+    return sum(i * c for i, c in enumerate(h)) / total if total else 0.0
+
 CONNECT_ATTEMPTS = 3
+# Server Demand Active ke baad pehla screen kuch seconds late bhejta hai.
+# Jab tak bitmap updates na aayein, screenshot black dikhta hai.
+SCREEN_WAIT_TIMEOUT = 20.0
 
 
 class RDPManager:
@@ -48,6 +58,10 @@ class RDPManager:
             domain=cfg["rdp_domain"] or None,
             width=cfg["rdp_width"],
             height=cfg["rdp_height"],
+            color_depth=cfg.get("rdp_color_depth", 32),
+            # Zaroori: False (default) PEH_PERF_DISABLE_WALLPAPER bhejta hai,
+            # jisse server poora desktop black/solid render karta hai.
+            show_wallpaper=True,
             capture_fps=cfg["capture_fps"],
         )
 
@@ -69,6 +83,48 @@ class RDPManager:
 
         self.client = client
         log.info("RDP connected: %s:%s", cfg["rdp_host"], cfg["rdp_port"])
+        await self.wait_for_screen()
+
+    async def wait_for_screen(
+        self, timeout: float | None = None, min_mean: float = 3.0, min_painted: float = 0.85
+    ) -> bool:
+        """Pehla screen aane ka intezaar karo (warna screenshot black rehta hai).
+
+        Server Demand Active ke baad desktop tile-by-tile paint karta hai, aur
+        pehla bitmap update ke baad bhi zyadaatar screen black rehta hai. Isliye
+        tab tak wait karte hain jab tak ~saara screen paint na ho jaye.
+        """
+        if not self.is_connected:
+            return False
+        timeout = SCREEN_WAIT_TIMEOUT if timeout is None else timeout
+        display = getattr(self.client, "display", None)
+        deadline = asyncio.get_event_loop().time() + timeout
+        last_applied = -1
+        stable_since: float | None = None
+        while asyncio.get_event_loop().time() < deadline:
+            stats = getattr(display, "_stats", None) or {}
+            applied = stats.get("bitmaps_applied", 0)
+            if applied:
+                img = await self.client.screenshot()
+                h = img.convert("L").histogram()
+                total = sum(h)
+                if total:
+                    mean = sum(i * c for i, c in enumerate(h)) / total
+                    painted = (total - h[0]) / total
+                    if mean >= min_mean and painted >= min_painted:
+                        # Paint abhi bhi chal raha ho to thoda aur ruko —
+                        # server ke paas tiles bhejne me waqt lagta hai.
+                        if applied == last_applied:
+                            if stable_since is not None and asyncio.get_event_loop().time() - stable_since >= 1.0:
+                                log.info("Screen ready (brightness=%.1f, painted=%.0f%%, bitmaps=%d)",
+                                         mean, painted * 100, applied)
+                                return True
+                        else:
+                            stable_since = asyncio.get_event_loop().time()
+                        last_applied = applied
+            await asyncio.sleep(0.5)
+        log.warning("Screen %ss me ready nahi hua", timeout)
+        return False
 
     async def disconnect(self) -> None:
         client, self.client = self.client, None

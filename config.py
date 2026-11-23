@@ -39,6 +39,7 @@ def load_config() -> dict:
         # Screen size aur performance
         "rdp_width": _int("RDP_WIDTH", 1366),
         "rdp_height": _int("RDP_HEIGHT", 768),
+        "rdp_color_depth": _int("RDP_COLOR_DEPTH", 32),
         "capture_fps": _int("CAPTURE_FPS", 5),
         # Typing speed (chars/sec)
         "type_cps": _float("TYPE_CPS", 12.0),

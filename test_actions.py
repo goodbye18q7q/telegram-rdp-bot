@@ -53,7 +53,7 @@ class TestCombo(unittest.TestCase):
 class TestParser(unittest.TestCase):
     def test_open_chrome(self):
         acts, _ = commands.parse_command("open chrome")
-        self.assertIn(("key", "win+r"), acts)
+        self.assertIn(("key", "ctrl+esc"), acts)
         self.assertIn(("text", "chrome"), acts)
 
     def test_open_instagram_web(self):
@@ -75,7 +75,7 @@ class TestParser(unittest.TestCase):
 
     def test_cmd(self):
         acts, _ = commands.parse_command("/cmd ipconfig")
-        self.assertIn(("key", "win+r"), acts)
+        self.assertIn(("key", "ctrl+esc"), acts)
         self.assertIn(("text", "powershell"), acts)
         self.assertIn(("text", "ipconfig"), acts)
 
@@ -100,7 +100,7 @@ class TestParser(unittest.TestCase):
 
     def test_a_win_search(self):
         acts = commands.a_win_search("chrome")
-        self.assertIn(("key", "win+r"), acts)
+        self.assertIn(("key", "ctrl+esc"), acts)
         self.assertIn(("text", "chrome"), acts)
         self.assertNotIn(("key", "enter"), acts)  # Enter is pressed later (for detection)
 
@@ -148,7 +148,7 @@ class TestApply(unittest.IsolatedAsyncioTestCase):
         for act in commands.a_search("instagram"):
             await actions.apply_action(c, act, cfg)
         kinds = [call[0] for call in c.calls]
-        self.assertEqual(kinds[0], "key")  # win+r
+        self.assertEqual(kinds[0], "key")  # ctrl+esc
         self.assertIn(("text", "instagram"), c.calls)
 
 

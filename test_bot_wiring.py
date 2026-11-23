@@ -75,7 +75,7 @@ class TestWiring(BotTestCase):
         asyncio.run(bot.on_message(update, MagicMock()))
         fake.execute.assert_awaited_once()
         actions = fake.execute.await_args[0][0]
-        self.assertIn(("key", "win+r"), actions)
+        self.assertIn(("key", "ctrl+esc"), actions)
         self.assertIn(("text", "chrome"), actions)
         msg.reply_text.assert_awaited_once()
 
@@ -355,10 +355,10 @@ class TestWinCtrl(BotTestCase):
         ctx = MagicMock()
         ctx.args = ["chrome"]
         same = self.img((10, 10, 10))
-        fake.screenshot = AsyncMock(side_effect=[same, same, same])
+        fake.screenshot = AsyncMock(side_effect=[same] * 12)
         asyncio.run(bot.cmd_win(update, ctx))
         text = msg.reply_text.await_args[0][0]
-        self.assertIn("Run dialog", text)
+        self.assertIn("Start menu", text)
         self.assertNotIn("Opened", text)
 
     def test_ctrl(self):
@@ -384,7 +384,10 @@ class TestRdpPatch(unittest.IsolatedAsyncioTestCase):
         import simple_rdp.client as cm
 
         self.assertTrue(
-            getattr(cm.RDPClient._handle_capability_exchange, "_rdpbot_tolerant_patched", False)
+            getattr(cm.RDPClient._handle_licensing, "_rdpbot_tolerant_patched", False)
+        )
+        self.assertTrue(
+            getattr(cm.RDPClient._handle_capability_exchange, "__name__", "") == "_tolerant_capability_exchange"
         )
 
     async def test_skips_data_pdu_then_succeeds(self):
@@ -400,14 +403,14 @@ class TestRdpPatch(unittest.IsolatedAsyncioTestCase):
 
         import rdp_patch
 
-        real = rdp_patch._original
-        rdp_patch._original = fake_original
+        real = rdp_patch._orig_capability
+        rdp_patch._orig_capability = fake_original
         try:
             result = await rdp_patch._tolerant_capability_exchange(object())
             self.assertEqual(result, "ok")
             self.assertEqual(calls["n"], 3)
         finally:
-            rdp_patch._original = real
+            rdp_patch._orig_capability = real
 
     async def test_gives_up_after_max_skip(self):
         import rdp_patch
@@ -415,13 +418,13 @@ class TestRdpPatch(unittest.IsolatedAsyncioTestCase):
         async def always_bad(self):
             raise ConnectionError("Expected Demand Active PDU, got type 0x17")
 
-        real = rdp_patch._original
-        rdp_patch._original = always_bad
+        real = rdp_patch._orig_capability
+        rdp_patch._orig_capability = always_bad
         try:
             with self.assertRaises(ConnectionError):
                 await rdp_patch._tolerant_capability_exchange(object())
         finally:
-            rdp_patch._original = real
+            rdp_patch._orig_capability = real
 
     async def test_other_errors_propagate(self):
         import rdp_patch
@@ -429,13 +432,13 @@ class TestRdpPatch(unittest.IsolatedAsyncioTestCase):
         async def boom(self):
             raise ConnectionError("auth failed")
 
-        real = rdp_patch._original
-        rdp_patch._original = boom
+        real = rdp_patch._orig_capability
+        rdp_patch._orig_capability = boom
         try:
             with self.assertRaises(ConnectionError):
                 await rdp_patch._tolerant_capability_exchange(object())
         finally:
-            rdp_patch._original = real
+            rdp_patch._orig_capability = real
 
     async def test_real_method_skips_0x17(self):
         """Asli _handle_capability_exchange: pehle 0x17, phir Demand Active -> success."""
