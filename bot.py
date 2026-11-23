@@ -962,13 +962,26 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                         log.info("Run dialog still open for %r; not reporting success", word)
                         continue
                 else:
-                    # Start -> Run
+                    # Start -> Run, but verify each window before typing so text never
+                    # leaks into the app behind a blocked Start/Run surface.
                     await mgr.execute([("key", "ctrl+esc"), ("wait", 0.8)])
+                    start_img = await mgr.screenshot_nowait()
+                    if diff_ratio(base, start_img) < 0.025:
+                        log.info("Start menu did not appear for %r; skip Start->Run", word)
+                        continue
                     await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
                     await mgr.execute([("text", "Run"), ("wait", 0.5), ("key", "enter"), ("wait", 1.5)])
-                    await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
-                    await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
+                    run_img = await mgr.screenshot_nowait()
+                    if diff_ratio(start_img, run_img) < 0.01:
+                        log.info("Run dialog did not appear from Start for %r; skip typing", word)
+                        continue
+                    await mgr.execute([("key", "ctrl+a"), ("text", word), ("wait", 0.4)])
+                    typed_img = await mgr.screenshot_nowait()
+                    await mgr.execute([("key", "enter"), ("wait", 2.0)])
                     after_img = await mgr.screenshot_nowait()
+                    if diff_ratio(typed_img, after_img) < 0.01:
+                        await mgr.execute([("click", int(600*mgr.client.width/1366), int(450*mgr.client.height/768), 1, False), ("wait", 4.0)])
+                        after_img = await mgr.screenshot_nowait()
                 r = diff_ratio(base, after_img)
                 from PIL import ImageChops, ImageOps
                 a = ImageOps.grayscale(base); b = ImageOps.grayscale(after_img)
@@ -982,60 +995,52 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             except Exception as e:
                 log.warning("simple fallback %s failed: %s", method, e)
                 continue
-        # Try 3: Task Manager -> File -> Run new task (bypasses Start/Run block)
-        # FIX: compare FINAL (after closing TM) vs BASE, not intermediate TM diff
+        # Try 3: Task Manager -> File -> Run new task using mouse clicks.
+        # On this host Task Manager opens in compact mode (no File menu); Alt+F/N
+        # silently fails. Expand it, choose File > Run new task, and click its OK button.
         try:
-            log.info("Trying Task Manager fallback for %r", word)
+            log.info("Trying mouse-driven Task Manager fallback for %r", word)
             base2 = desktop_simple
             await mgr.execute([("key", "ctrl+shift+esc"), ("wait", 2.0)])
-            tm = await mgr.screenshot()
+            tm = await mgr.screenshot_nowait()
             r_tm = diff_ratio(base2, tm)
-            log.info("taskmgr open diff %.3f", r_tm)
+            sw, sh = mgr.client.width, mgr.client.height
+            sx, sy = sw / 1366.0, sh / 768.0
+            log.info("taskmgr open diff %.3f at %dx%d", r_tm, sw, sh)
             if r_tm > 0.02:
-                await mgr.execute([("key", "alt+f"), ("wait", 0.5)])
-                await asyncio.sleep(0.3)
-                await mgr.execute([("key", "n"), ("wait", 0.8)])
-                # Check if 'Create new task' dialog appeared
-                dlg = await mgr.screenshot()
+                # Expanded Task Manager reaches x≈776,y≈697; compact one ends near y≈469.
+                # A white pixel at this point indicates it's already expanded.
+                probe = tm.convert("RGB").getpixel((min(sw-1, int(0.52*sw)), min(sh-1, int(0.78*sh))))
+                already_expanded = sum(probe) / 3 > 190
+                if not already_expanded:
+                    await mgr.execute([("click", int(170*sx), int(444*sy), 1, False), ("wait", 1.5)])
+                # Open File menu, then click the actual Run new task menu item.
+                await mgr.execute([("click", int(128*sx), int(143*sy), 1, False), ("wait", 0.4),
+                                   ("click", int(185*sx), int(167*sy), 1, False), ("wait", 1.0)])
+                dlg = await mgr.screenshot_nowait()
                 r_dlg = diff_ratio(tm, dlg)
-                log.info("taskmgr dialog diff vs tm %.3f", r_dlg)
-                if r_dlg < 0.01:
-                    log.info("Create new task dialog not opened for %r (r_dlg %.3f), abort taskmgr path", word, r_dlg)
-                    await mgr.execute([("key", "escape"), ("wait", 0.5), ("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.5)])
-                else:
-                    await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
-                    await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 3.0)])
-                    # Close Task Manager first, then check if app stayed open
-                    await mgr.execute([("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.8)])
-                    await asyncio.sleep(0.5)
-                    final = await mgr.screenshot()
-                    r = diff_ratio(base2, final)
-                    from PIL import ImageChops, ImageOps
-                    a = ImageOps.grayscale(base2); b = ImageOps.grayscale(final)
-                    if a.size != b.size: b = b.resize(a.size)
-                    hist = ImageChops.difference(a,b).histogram()
-                    r10 = sum(hist[10:])/(a.size[0]*a.size[1])
-                    log.info("taskmgr final %r -> diff vs base %.3f thr10 %.3f (dlg was %.3f)", word, r, r10, r_dlg)
-                    if r > 0.02 or r10 > 0.03:
-                        # Verify it's not just black/signout screen
-                        from PIL import Image
-                        # brightness check - black screen = failure
-                        try:
-                            bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
-                            if bright < 0.05:
-                                log.info("taskmgr final is black, treat as Not found")
-                            else:
-                                return f"Opened: {word}"
-                        except:
+                log.info("Task Manager Create new task dialog diff %.3f", r_dlg)
+                if r_dlg > 0.01:
+                    # Focus Open field, replace any old history text, then physically click OK.
+                    await mgr.execute([("click", int(340*sx), int(266*sy), 1, False),
+                                       ("key", "ctrl+a"), ("text", word), ("wait", 0.4)])
+                    typed = await mgr.screenshot_nowait()
+                    await mgr.execute([("click", int(273*sx), int(330*sy), 1, False), ("wait", 6.0)])
+                    final = await mgr.screenshot_nowait()
+                    r_final = diff_ratio(typed, final)
+                    log.info("taskmgr Run new task click %r -> diff from typed dialog %.3f", word, r_final)
+                    # Keep the launched app in front; do not Alt+F4 the active window.
+                    if r_final > 0.02:
+                        from PIL import ImageOps
+                        bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
+                        if bright > 0.05:
                             return f"Opened: {word}"
-                    # also ensure we cleaned up
+                else:
+                    log.info("Create new task dialog did not appear after mouse menu clicks")
             else:
-                await mgr.execute([("key", "escape"), ("wait", 0.5)])
+                log.info("Task Manager did not open; skip Task Manager fallback")
         except Exception as e:
-            log.warning("taskmgr fallback failed: %s", e)
-            try:
-                await mgr.execute([("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.5)])
-            except: pass
+            log.warning("mouse-driven Task Manager fallback failed: %s", e)
         return f"Not found: {word}"
     if not await _ensure_xvfb():
         return None
