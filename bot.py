@@ -1018,8 +1018,17 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             r_tm = diff_ratio(base2, tm)
             sw, sh = mgr.client.width, mgr.client.height
             sx, sy = sw / 1366.0, sh / 768.0
-            log.info("taskmgr open diff %.3f at %dx%d", r_tm, sw, sh)
-            if r_tm > 0.02:
+            # A minimized/background Task Manager may already exist; Ctrl+Shift+Esc
+            # can bring it forward with a small pixel diff. Identify its title text
+            # at the known window origin instead of relying on a large full-screen diff.
+            title_crop = tm.convert("RGB").crop((int(120*sx), int(108*sy), int(250*sx), int(132*sy)))
+            title_dark = sum(1 for px in title_crop.getdata() if max(px) < 140)
+            is_taskmgr = title_dark > 20
+            log.info("taskmgr probe diff %.3f title_dark %d at %dx%d", r_tm, title_dark, sw, sh)
+            if is_taskmgr:
+                # Task Manager may be visible but inactive behind Chrome. Activate
+                # its title bar first or the first menu click only changes focus.
+                await mgr.execute([("click", int(300*sx), int(118*sy), 1, False), ("wait", 0.3)])
                 # Expanded Task Manager reaches x≈776,y≈697; compact one ends near y≈469.
                 # A white pixel at this point indicates it's already expanded.
                 probe = tm.convert("RGB").getpixel((min(sw-1, int(0.52*sw)), min(sh-1, int(0.78*sh))))
@@ -1029,26 +1038,35 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                 # Open File menu, then click the actual Run new task menu item.
                 await mgr.execute([("click", int(128*sx), int(143*sy), 1, False), ("wait", 0.4),
                                    ("click", int(185*sx), int(167*sy), 1, False), ("wait", 1.0)])
-                dlg = await mgr.screenshot_nowait()
-                r_dlg = diff_ratio(tm, dlg)
-                log.info("Task Manager Create new task dialog diff %.3f", r_dlg)
-                if r_dlg > 0.01:
-                    # Focus Open field, replace any old history text, then physically click OK.
-                    await mgr.execute([("click", int(340*sx), int(266*sy), 1, False),
-                                       ("key", "ctrl+a"), ("text", word), ("wait", 0.4)])
-                    typed = await mgr.screenshot_nowait()
-                    await mgr.execute([("click", int(273*sx), int(330*sy), 1, False), ("wait", 6.0)])
-                    final = await mgr.screenshot_nowait()
-                    r_final = diff_ratio(typed, final)
-                    log.info("taskmgr Run new task click %r -> diff from typed dialog %.3f", word, r_final)
-                    # Keep the launched app in front; do not Alt+F4 the active window.
-                    if r_final > 0.02:
-                        from PIL import ImageOps
-                        bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
-                        if bright > 0.05:
-                            return f"Opened: {word}"
-                else:
-                    log.info("Create new task dialog did not appear after mouse menu clicks")
+                # Let the modal settle, then immediately type. Avoid an intermediate
+                # screenshot here: on this RemoteApp it can leave the modal unfocused.
+                await asyncio.sleep(0.6)
+                # We already clicked File > Run new task; focus the known Open field,
+                # replace prior history text, and physically click OK.
+                # Run new task opens with the Open field focused; click once to make
+                # sure the dialog owns focus, then select its previous history text.
+                await mgr.execute([("click", int(340*sx), int(266*sy), 1, False), ("wait", 0.5),
+                                   ("key", "ctrl+a"), ("wait", 0.3)])
+                # This RemoteApp drops Unicode chars at the default 12 cps; type slowly
+                # so long URLs aren't truncated, then restore the user's normal rate.
+                old_cps = mgr.cfg.get("type_cps", 12.0)
+                try:
+                    mgr.cfg["type_cps"] = 1.5
+                    await mgr.execute([("text", word)])
+                finally:
+                    mgr.cfg["type_cps"] = old_cps
+                await asyncio.sleep(0.8)
+                typed = await mgr.screenshot_nowait()
+                await mgr.execute([("click", int(273*sx), int(330*sy), 1, False), ("wait", 6.0)])
+                final = await mgr.screenshot_nowait()
+                r_final = diff_ratio(typed, final)
+                log.info("taskmgr Run new task click %r -> diff from typed dialog %.3f", word, r_final)
+                # Keep the launched app in front; do not Alt+F4 the active window.
+                if r_final > 0.02:
+                    from PIL import ImageOps
+                    bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
+                    if bright > 0.05:
+                        return f"Opened: {word}"
             else:
                 log.info("Task Manager did not open; skip Task Manager fallback")
         except Exception as e:
@@ -1132,9 +1150,33 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
         subprocess.run(["xdotool", "key", "BackSpace"], env=env, timeout=5)
         await asyncio.sleep(0.3)
         subprocess.run(["xdotool", "type", word], env=env, timeout=5)
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(min(10.0, max(2.0, len(word) * 0.08)))
+        # Snapshot the populated Run dialog before submitting. On the Tally host,
+        # Return can be swallowed; in that case physically click its OK button.
+        from PIL import Image
+        typed_run = None
+        try:
+            subprocess.run(["import", "-window", wid, "/tmp/_fb_typed.png"], env=env, timeout=5)
+            if os.path.getsize("/tmp/_fb_typed.png") > 5000:
+                typed_run = Image.open("/tmp/_fb_typed.png").copy()
+        except Exception as e:
+            log.warning("FreeRDP typed-dialog capture failed: %s", e)
         subprocess.run(["xdotool", "key", "Return"], env=env, timeout=5)
-        await asyncio.sleep(3.5)
+        await asyncio.sleep(2.0)
+        return_img = None
+        try:
+            subprocess.run(["import", "-window", wid, "/tmp/_fb_return.png"], env=env, timeout=5)
+            if os.path.getsize("/tmp/_fb_return.png") > 5000:
+                return_img = Image.open("/tmp/_fb_return.png").copy()
+        except Exception:
+            pass
+        if typed_run is not None and return_img is not None and diff_ratio(typed_run, return_img) < 0.01:
+            # 1366x768 Run dialog OK button is centered around (647,436).
+            log.info("Run dialog still unchanged after Return for %r; clicking OK", word)
+            subprocess.run(["xdotool", "mousemove", "--window", wid, "647", "436"], env=env, timeout=5)
+            await asyncio.sleep(0.2)
+            subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, timeout=5)
+        await asyncio.sleep(5.0)
         # Capture inside FreeRDP before closing — this is the reliable check
         # (simple-rdp reconnect loses the window, inside import keeps it)
         r_after = 0.0
