@@ -196,6 +196,59 @@ class TestProfiles(BotTestCase):
         self.assertIn("rdp1", bot.profiles)
         self.assertEqual(bot.current["host"], "8.8.8.8")
 
+    def test_one_shot_with_port(self):
+        fake = self.use_fake()
+        update, msg = make_update("/connect 8.8.8.8 65430 admin pw")
+        ctx = MagicMock()
+        ctx.args = ["8.8.8.8", "65430", "admin", "pw"]
+        asyncio.run(bot.cmd_connect(update, ctx))
+        fake.connect.assert_awaited_once()
+        self.assertEqual(bot.current["port"], 65430)
+        self.assertEqual(bot.current["user"], "admin")
+
+    def test_garbage_host_rejected(self):
+        # User ne bot ka prompt hi copy karke IP bhej diya tha -> reject hona chahiye
+        self.use_fake()
+        update, msg = make_update("/connect")
+        ctx = MagicMock()
+        ctx.args = []
+        asyncio.run(bot.cmd_connect(update, ctx))
+        self.assertEqual(bot.connect_sessions[555]["step"], "ip")
+
+        prompt = "🌐 Host: 202.140.136.146  Port: 8250\n👤 Ab username bhejo:"
+        u2, m2 = make_update(prompt, chat_id=555)
+        asyncio.run(bot.on_message(u2, MagicMock()))
+        self.assertIn("Ye IP nahi lag raha", m2.reply_text.await_args[0][0])
+        # step wahi rakho — galat input par loop na ho
+        self.assertEqual(bot.connect_sessions[555]["step"], "ip")
+
+        u3, m3 = make_update("202.140.136.146:8250", chat_id=555)
+        asyncio.run(bot.on_message(u3, MagicMock()))
+        self.assertEqual(bot.connect_sessions[555]["host"], "202.140.136.146")
+        self.assertEqual(bot.connect_sessions[555]["port"], 8250)
+
+        u4, m4 = make_update("admin", chat_id=555)
+        asyncio.run(bot.on_message(u4, MagicMock()))
+        u5, m5 = make_update("secret", chat_id=555)
+        asyncio.run(bot.on_message(u5, MagicMock()))
+        fake = bot.get_mgr()
+        fake.connect.assert_awaited_once()
+        self.assertEqual(bot.current["host"], "202.140.136.146")
+        self.assertEqual(bot.current["port"], 8250)
+        self.assertEqual(bot.current["user"], "admin")
+
+    def test_validate_host(self):
+        for good in ("1.2.3.4", "1.2.3.4:65430", "rdp.example.com", "[2001:db8::1]:3389", "my-host_1"):
+            self.assertIsNotNone(bot.validate_host(good), good)
+        for bad in (
+            "",
+            "🌐 Host: 1.2.3.4  Port: 8250",
+            "1.2.3.4\n👤 Now send the username:",
+            "hello world",
+            "!!!",
+        ):
+            self.assertIsNone(bot.validate_host(bad), repr(bad))
+
     def test_remove(self):
         self.save_profile()
         update, msg = make_update("/remove rdp1")

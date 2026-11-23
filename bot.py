@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -166,6 +167,22 @@ def split_host_port(text: str, default_port: int = 3389) -> tuple[str, int]:
     return text, default_port
 
 
+_HOST_RE = re.compile(r"^[A-Za-z0-9._\[\]:-]+$")
+
+
+def validate_host(text: str) -> str | None:
+    """IP/hostname sahi hai? Garbage (prompt copy, emoji, spaces) reject karo."""
+    t = (text or "").strip()
+    if not t or len(t) > 253:
+        return None
+    if not _HOST_RE.match(t):  # space/newline/emoji/bhasha -> reject
+        return None
+    # kam se kam ek alphanumeric character chahiye
+    if not re.search(r"[A-Za-z0-9]", t):
+        return None
+    return t
+
+
 def diff_ratio(img_a, img_b) -> float:
     """Fraction of pixels that differ by more than 40 (grayscale)."""
     a = ImageOps.grayscale(img_a)
@@ -280,6 +297,9 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     name = args[0].lower()
+    if validate_host(args[1]) is None:
+        await update.message.reply_text(f"⚠️ Host sahi nahi lag raha: {args[1]}")
+        return
     host, port = split_host_port(args[1])
     profiles[name] = {"host": host, "port": port, "user": args[2], "password": args[3]}
     save_profiles()
@@ -351,13 +371,22 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await cmd_switch(update, context)
         return
 
-    # /connect <host> <user> <pass> — one shot, saved as a new profile
+    # /connect <host> <user> <pass>  — ya —  /connect <host> <port> <user> <pass>
     if len(args) >= 3:
-        host, port = split_host_port(args[0])
+        if len(args) >= 4 and args[1].isdigit():
+            host, _ = split_host_port(args[0])
+            port = int(args[1])
+            user, pw = args[2], args[3]
+        else:
+            host, port = split_host_port(args[0])
+            user, pw = args[1], args[2]
+        if not validate_host(host):
+            await update.message.reply_text(f"⚠️ Host sahi nahi lag raha: {args[0]}")
+            return
         name = next_profile_name()
-        profiles[name] = {"host": host, "port": port, "user": args[1], "password": args[2]}
+        profiles[name] = {"host": host, "port": port, "user": user, "password": pw}
         save_profiles()
-        current.update(name=name, host=host, port=port, user=args[1], password=args[2])
+        current.update(name=name, host=host, port=port, user=user, password=pw)
         connect_sessions.pop(chat_id, None)
         await _do_connect(update)
         return
@@ -365,31 +394,42 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Step-by-step flow
     session = {"step": "ip"}
     if len(args) == 1:
-        host, port = split_host_port(args[0])
-        session["host"] = host
-        session["port"] = port
+        host = validate_host(args[0])
+        if host is None:
+            await update.message.reply_text(f"⚠️ Host sahi nahi lag raha: {args[0]}")
+            return
+        session["host"], session["port"] = split_host_port(host)
         session["step"] = "user"
     elif len(args) == 2:
-        host, port = split_host_port(args[0])
-        session["host"] = host
-        session["port"] = port
-        session["user"] = args[1]
-        session["step"] = "pass"
+        host = validate_host(args[0])
+        if host is None:
+            await update.message.reply_text(f"⚠️ Host sahi nahi lag raha: {args[0]}")
+            return
+        session["host"], session["port"] = split_host_port(host)
+        if args[1].isdigit():          # /connect 1.2.3.4 3389  -> port, ab username maango
+            session["port"] = int(args[1])
+            session["step"] = "user"
+        else:                          # /connect 1.2.3.4 admin  -> username diya
+            session["user"] = args[1]
+            session["step"] = "pass"
 
     connect_sessions[chat_id] = session
 
     if session["step"] == "ip":
         await update.message.reply_text(
-            "🔌 RDP connect — send the IP address first.\n"
-            "Port is 3389: send just the IP (1.2.3.4).\n"
-            "Different port: send IP:port — e.g. 1.2.3.4:65430.\n"
-            "Send /cancel to stop."
+            "🔌 RDP connect — pehle IP address bhejo.\n"
+            "• Port 3389 hai to sirf IP:  1.2.3.4\n"
+            "• Alag port hai to:  1.2.3.4:65430\n"
+            "• Ya dono alag-alag:  /connect 1.2.3.4 65430\n"
+            "/cancel bhejo to ruk jayega."
         )
     elif session["step"] == "user":
-        await update.message.reply_text(f"🌐 IP: {session['host']}  Port: {session['port']}\n👤 Now send the username:")
+        await update.message.reply_text(
+            f"🌐 Host: {session['host']}  Port: {session['port']}\n👤 Ab username bhejo:"
+        )
     else:
         await update.message.reply_text(
-            f"🌐 IP: {session['host']}  👤 {session['user']}\n🔑 Now send the password:"
+            f"🌐 Host: {session['host']}  👤 {session['user']}\n🔑 Ab password bhejo:"
         )
 
 
@@ -399,11 +439,18 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
     step = session["step"]
 
     if step == "ip":
-        host, port = split_host_port(text)
-        session["host"] = host
-        session["port"] = port
+        host = validate_host(text)
+        if host is None:
+            await update.message.reply_text(
+                f"⚠️ Ye IP nahi lag raha: {text[:60]}\n"
+                "Sirf IP/hostname bhejo — masalan 1.2.3.4 ya 1.2.3.4:65430"
+            )
+            return
+        session["host"], session["port"] = split_host_port(host)
         session["step"] = "user"
-        await update.message.reply_text(f"🌐 Host: {host}  Port: {port}\n👤 Now send the username:")
+        await update.message.reply_text(
+            f"🌐 Host: {session['host']}  Port: {session['port']}\n👤 Ab username bhejo:"
+        )
     elif step == "user":
         session["user"] = text
         session["step"] = "pass"
