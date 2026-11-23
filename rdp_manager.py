@@ -24,7 +24,7 @@ def _brightness(img) -> float:
 CONNECT_ATTEMPTS = 3
 # Server Demand Active ke baad pehla screen kuch seconds late bhejta hai.
 # Jab tak bitmap updates na aayein, screenshot black dikhta hai.
-SCREEN_WAIT_TIMEOUT = 20.0
+SCREEN_WAIT_TIMEOUT = 30.0
 
 
 class RDPManager:
@@ -73,12 +73,21 @@ class RDPManager:
                 break
             except Exception as e:
                 last = e
-                log.warning("connect attempt %d/%d failed: %s", attempt, CONNECT_ATTEMPTS, e)
+                msg = str(e)
+                # Give helpful hint for common NLA/CredSSP failures
+                if "3221225581" in msg or "CredSSP" in msg:
+                    msg += " — CredSSP/NLA verification failed. Username/password sahi hai? Domain chahiye? (e.g. TechTally\\Ajay)"
+                elif "LOGON_FAILURE" in msg:
+                    msg += " — Logon failed. Username/password ya domain check karo."
+                log.warning("connect attempt %d/%d failed: %s", attempt, CONNECT_ATTEMPTS, msg)
                 with contextlib.suppress(Exception):
                     await client.disconnect()
                 if attempt < CONNECT_ATTEMPTS:
                     await asyncio.sleep(1.0 * attempt)
         else:
+            # Re-raise with hint
+            if last and ("3221225581" in str(last) or "CredSSP" in str(last)):
+                raise ConnectionError(f"{last} — Hint: NLA/CredSSP failed. Try /add with domain e.g. 'TechTally' or check password. FreeRDP me bhi LOGON_FAILURE aaya.") from last
             raise last  # type: ignore[misc]
 
         self.client = client
@@ -97,32 +106,25 @@ class RDPManager:
         if not self.is_connected:
             return False
         timeout = SCREEN_WAIT_TIMEOUT if timeout is None else timeout
-        display = getattr(self.client, "display", None)
         deadline = asyncio.get_event_loop().time() + timeout
-        last_applied = -1
-        stable_since: float | None = None
+        ready_since: float | None = None
         while asyncio.get_event_loop().time() < deadline:
-            stats = getattr(display, "_stats", None) or {}
-            applied = stats.get("bitmaps_applied", 0)
-            if applied:
-                img = await self.client.screenshot()
-                h = img.convert("L").histogram()
-                total = sum(h)
-                if total:
-                    mean = sum(i * c for i, c in enumerate(h)) / total
-                    painted = (total - h[0]) / total
-                    if mean >= min_mean and painted >= min_painted:
-                        # Paint abhi bhi chal raha ho to thoda aur ruko —
-                        # server ke paas tiles bhejne me waqt lagta hai.
-                        if applied == last_applied:
-                            if stable_since is not None and asyncio.get_event_loop().time() - stable_since >= 1.0:
-                                log.info("Screen ready (brightness=%.1f, painted=%.0f%%, bitmaps=%d)",
-                                         mean, painted * 100, applied)
-                                return True
-                        else:
-                            stable_since = asyncio.get_event_loop().time()
-                        last_applied = applied
-            await asyncio.sleep(0.5)
+            img = await self.client.screenshot()
+            h = img.convert("L").histogram()
+            total = sum(h)
+            if total:
+                mean = sum(i * c for i, c in enumerate(h)) / total
+                painted = (total - h[0]) / total
+                if mean >= min_mean and painted >= min_painted:
+                    # Paint abhi bhi chal raha ho to thoda aur ruko.
+                    if ready_since is None:
+                        ready_since = asyncio.get_event_loop().time()
+                    elif asyncio.get_event_loop().time() - ready_since >= 0.8:
+                        log.info("Screen ready (brightness=%.1f, painted=%.0f%%)", mean, painted * 100)
+                        return True
+                else:
+                    ready_since = None
+            await asyncio.sleep(0.4)
         log.warning("Screen %ss me ready nahi hua", timeout)
         return False
 
@@ -147,6 +149,8 @@ class RDPManager:
     async def screenshot(self):
         """Remote desktop ki current photo (PIL Image)."""
         await self.ensure()
+        # Screen abhi paint nahi hua to thoda ruko (warna photo black aati hai).
+        await self.wait_for_screen(timeout=10.0)
         return await self.client.screenshot()
 
     def status_text(self) -> str:

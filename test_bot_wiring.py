@@ -329,7 +329,8 @@ class TestWinCtrl(BotTestCase):
         ctx = MagicMock()
         ctx.args = ["chrome"]
         fake.screenshot = AsyncMock(
-            side_effect=[self.img((0, 0, 0)), self.img((80, 80, 80)), self.img((255, 255, 255))]
+            side_effect=[self.img((0, 0, 0)), self.img((80, 80, 80)),
+                         self.img((255, 255, 255)), self.img((255, 255, 255))]
         )
         asyncio.run(bot.cmd_win(update, ctx))
         self.assertIn("Opened", msg.reply_text.await_args[0][0])
@@ -343,7 +344,7 @@ class TestWinCtrl(BotTestCase):
         ctx.args = ["zzznotanapp"]
         desktop = self.img((0, 0, 0))
         fake.screenshot = AsyncMock(
-            side_effect=[desktop, self.img((80, 80, 80)), desktop]
+            side_effect=[desktop, self.img((80, 80, 80)), desktop, desktop]
         )
         asyncio.run(bot.cmd_win(update, ctx))
         self.assertIn("Not found", msg.reply_text.await_args[0][0])
@@ -355,7 +356,7 @@ class TestWinCtrl(BotTestCase):
         ctx = MagicMock()
         ctx.args = ["chrome"]
         same = self.img((10, 10, 10))
-        fake.screenshot = AsyncMock(side_effect=[same] * 12)
+        fake.screenshot = AsyncMock(side_effect=[same] * 16)
         asyncio.run(bot.cmd_win(update, ctx))
         text = msg.reply_text.await_args[0][0]
         self.assertIn("Start menu", text)

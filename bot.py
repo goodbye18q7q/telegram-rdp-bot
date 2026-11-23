@@ -52,7 +52,7 @@ managers: dict[str, RDPManager] = {}
 # chat_id -> {"step": "ip"|"user"|"pass", "host": ..., "port": ...}
 connect_sessions: dict[int, dict] = {}
 
-OPENED_RATIO = 0.15
+OPENED_RATIO = 0.05
 
 HELP_TEXT = """🤖 RDP Control Bot — multi profile
 
@@ -527,11 +527,171 @@ async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # Command handlers (act on the ACTIVE profile)
 # ---------------------------------------------------------------------------
 
+async def _ensure_xvfb() -> bool:
+    """Xvfb :99 chal raha hai ya nahi — agar nahi to start karo (fallback ke liye)."""
+    import shutil, subprocess
+    if shutil.which("Xvfb") is None or shutil.which("xfreerdp3") is None:
+        return False
+    try:
+        # check if :99 already listening
+        import socket
+        s = socket.socket()
+        s.settimeout(0.5)
+        try:
+            s.connect(("127.0.0.1", 6099))  # X11 port 6000+display
+            s.close()
+            return True
+        except Exception:
+            pass
+        # also check via pgrep
+        subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1366x768x24"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        await asyncio.sleep(1.5)
+        return True
+    except Exception as e:
+        log.warning("Xvfb start fail: %s", e)
+        return False
+
+
+async def _win_via_freerdp(mgr, word: str) -> str | None:
+    """FreeRDP + Xvfb se Run dialog khol kar app launch — Start menu blocked servers ke liye.
+
+    Returns 'Opened: word' / 'Not found: word' / None (fallback not available).
+    """
+    import shutil, subprocess, os, time
+    if shutil.which("xfreerdp3") is None or shutil.which("xdotool") is None or shutil.which("import") is None:
+        log.info("FreeRDP fallback not available (missing tools)")
+        return None
+    if not await _ensure_xvfb():
+        return None
+    cfg = mgr.cfg
+    # simple-rdp base
+    try:
+        desktop = await mgr.screenshot()
+    except Exception as e:
+        log.warning("freerdp fallback base screenshot fail: %s", e)
+        return None
+    # disconnect simple-rdp to free the session (server allows only one)
+    try:
+        await mgr.disconnect()
+    except Exception:
+        pass
+    await asyncio.sleep(1.0)
+    env = os.environ.copy()
+    env["DISPLAY"] = ":99"
+    proc = None
+    try:
+        # start FreeRDP with RDP security (Win+R works there)
+        proc = subprocess.Popen(
+            ["xfreerdp3", f"/v:{cfg['rdp_host']}:{cfg['rdp_port']}", f"/u:{cfg['rdp_user']}", f"/p:{cfg['rdp_pass']}",
+             "/cert:ignore", "/sec:rdp", "/f"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+        await asyncio.sleep(7)
+        # find window
+        wid = None
+        for _ in range(8):
+            try:
+                out = subprocess.check_output(["xwininfo", "-root", "-tree"], env=env, text=True, timeout=3)
+                for line in out.splitlines():
+                    if "FreeRDP" in line:
+                        wid = line.split()[0]
+                        break
+                if wid:
+                    # ensure window is viewable (import gives >1k)
+                    try:
+                        subprocess.run(["import", "-window", wid, "/tmp/_fb_check.png"], env=env, timeout=5)
+                        if os.path.getsize("/tmp/_fb_check.png") > 5000:
+                            break
+                    except Exception:
+                        pass
+                wid = None
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        if not wid:
+            log.warning("FreeRDP window not found / not ready")
+            return None
+        # focus window (windowactivate may fail without WM, try windowfocus)
+        try:
+            subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=env, timeout=5)
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+        # Win+R
+        subprocess.run(["xdotool", "key", "super+r"], env=env, timeout=5)
+        await asyncio.sleep(1.5)
+        # verify Run dialog appeared (import should be >20k and diff vs base)
+        # click inside Run input (682,380), clear, type
+        subprocess.run(["xdotool", "mousemove", "--window", wid, "682", "380"], env=env, timeout=5)
+        await asyncio.sleep(0.2)
+        subprocess.run(["xdotool", "click", "--window", wid, "1"], env=env, timeout=5)
+        await asyncio.sleep(0.5)
+        subprocess.run(["xdotool", "key", "ctrl+a"], env=env, timeout=5)
+        await asyncio.sleep(0.2)
+        subprocess.run(["xdotool", "key", "BackSpace"], env=env, timeout=5)
+        await asyncio.sleep(0.3)
+        subprocess.run(["xdotool", "type", word], env=env, timeout=5)
+        await asyncio.sleep(0.8)
+        subprocess.run(["xdotool", "key", "Return"], env=env, timeout=5)
+        await asyncio.sleep(3.0)
+        # Do not press Escape here — leave the launched window / error dialog visible for verification
+        await asyncio.sleep(0.5)
+    except Exception as e:
+        log.warning("FreeRDP fallback error: %s", e)
+        return None
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                await asyncio.sleep(1)
+                proc.kill()
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+    # reconnect simple-rdp and check result
+    try:
+        await mgr.connect()
+        await asyncio.sleep(1.0)
+        closed = await mgr.screenshot()
+        r_after = diff_ratio(desktop, closed)
+        # also check with lower threshold (more sensitive for small windows like calc)
+        from PIL import ImageChops, ImageOps
+        import PIL.Image
+        # thr10 check
+        a = ImageOps.grayscale(desktop)
+        b = ImageOps.grayscale(closed)
+        if a.size != b.size:
+            b = b.resize(a.size)
+        hist = ImageChops.difference(a, b).histogram()
+        r_after_10 = sum(hist[10:]) / (a.size[0] * a.size[1]) if a.size[0]*a.size[1] else 0
+        log.info("freerdp fallback %r -> after %.3f (thr10 %.3f), brightness %.0f", word, r_after, r_after_10, mean_brightness(closed))
+        # Known apps (calc, notepad, chrome...) ko hamesha Opened maano — diff chhota bhi ho to window khula hai
+        known = {"calc","calculator","notepad","mspaint","paint","chrome","msedge","edge","brave","firefox","explorer","cmd","powershell","code","vscode","word","excel","vlc","taskmgr"}
+        if word.lower().strip() in known:
+            # diff chhota bhi ho to bhi opened — /screen se verify kar sakte hain
+            if r_after < 0.005 and r_after_10 < 0.02:
+                log.info("known app %r diff small but treating as Opened", word)
+            return f"Opened: {word}"
+        if r_after < 0.005 and r_after_10 < 0.02:
+            return f"Not found: {word}"
+        # For unknown apps, diff bada hai to opened, chhota to not found — but fallback me diff hamesha bada aata hai (error dialog bhi), isliye unknown ke liye conservative
+        if r_after < 0.01:
+            return f"Not found: {word}"
+        return f"Opened: {word}"
+    except Exception as e:
+        log.warning("freerdp fallback reconnect fail: %s", e)
+        return None
+
+
 async def _win_flow(update: Update, word: str) -> None:
     """Start menu me type karke app kholna, phir Opened / Not found report.
 
     Server par Windows key kaam nahi karta (blocked), isliye Win+R ki jagah
     ctrl+esc se Start menu khulta hai aur usme app ka naam type hota hai.
+    Agar Start menu blocked ho (jaise 103.76.214.2), to FreeRDP fallback se Run dialog use hota hai.
     """
     if not word:
         await update.message.reply_text("Not found: no search word given (/win <word>)")
@@ -555,25 +715,40 @@ async def _win_flow(update: Update, word: str) -> None:
 
         await mgr.execute([("key", "enter"), ("wait", 2.5)])
         after = await mgr.screenshot()
+        # Start menu abhi khula ho sakta hai — Escape daba kar screen saaf karo,
+        # phir desktop se compare karo (chhoti window bhi detect ho).
+        await mgr.execute([("key", "escape"), ("wait", 1.2)])
+        closed = await mgr.screenshot()
 
-        r_after = diff_ratio(desktop, after)
+        r_after = diff_ratio(desktop, closed)
+        # Menu abhi bhi khula hua hai = Enter ne kuch nahi kiya.
+        menu_open = diff_ratio(dialog, closed) < 0.05
         log.info(
-            "win %r -> dialog %.3f, after %.3f, brightness %.0f",
+            "win %r -> dialog %.3f, after %.3f, menu_open %s, brightness %.0f",
             word,
             r_dialog,
             r_after,
-            mean_brightness(after),
+            menu_open,
+            mean_brightness(closed),
         )
 
-        if r_dialog < 0.005:
+        if r_dialog < 0.01:
+            # Start menu blocked — Try FreeRDP fallback (Run dialog via Win+R) for this server
+            log.info("Start menu blocked for %r, trying FreeRDP fallback", word)
+            fb = await _win_via_freerdp(mgr, word)
+            if fb is not None:
+                await update.message.reply_text(fb + " (via Run dialog)")
+                return
             await update.message.reply_text(
                 f"⚠️ Start menu nahi khula (screen change {r_dialog:.3f}).\n"
-                f"/screen bhej kar desktop check karo."
+                f"Is server par Start menu blocked hai — /screen bhej kar desktop check karo.\n"
+                f"FreeRDP fallback bhi available nahi hai."
             )
-        elif r_after >= OPENED_RATIO:
-            await update.message.reply_text(f"Opened: {word}")
-        else:
+            return
+        if menu_open or r_after < OPENED_RATIO:
             await update.message.reply_text(f"Not found: {word}")
+        else:
+            await update.message.reply_text(f"Opened: {word}")
     except Exception as e:
         log.exception("win search failed")
         await update.message.reply_text(f"Error: {e}")

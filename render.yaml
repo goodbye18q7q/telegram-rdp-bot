@@ -6,8 +6,10 @@ services:
     name: telegram-rdp-bot
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    buildCommand: |
+      sudo apt-get update && sudo apt-get install -y xvfb xfreerdp3 xdotool imagemagick x11-utils || apt-get update && apt-get install -y xvfb xfreerdp3 xdotool imagemagick x11-utils
+      pip install -r requirements.txt
+    startCommand: Xvfb :99 -screen 0 1366x768x24 > /tmp/xvfb.log 2>&1 & python bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false        # fill in the dashboard
