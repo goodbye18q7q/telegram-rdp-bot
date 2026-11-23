@@ -465,6 +465,19 @@ def start_health_server() -> None:
                         loop.close()
                     except Exception as e: self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers(); self.wfile.write(json.dumps({"error":str(e)}).encode())
                     return
+                if path == "/api/tools":
+                    import shutil, glob
+                    data = {
+                        "xvfb": shutil.which("Xvfb"),
+                        "xfreerdp3": shutil.which("xfreerdp3"),
+                        "xfreerdp": shutil.which("xfreerdp"),
+                        "xdotool": shutil.which("xdotool"),
+                        "import": shutil.which("import"),
+                        "freerdp_bin": _freerdp_bin(),
+                        "glob": glob.glob("/usr/bin/*freerdp*") + glob.glob("/usr/bin/*xvfb*") + glob.glob("/usr/bin/xdotool*"),
+                        "path": os.environ.get("PATH"),
+                    }
+                    self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(json.dumps(data).encode()); return
                 if path == "/api/run":
                     prof = (qs.get("profile") or [None])[0]
                     appname = (qs.get("app") or ["calc"])[0]
@@ -897,8 +910,17 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
     """
     import shutil, subprocess, os, time
     freerdp = _freerdp_bin()
-    if freerdp is None or shutil.which("xdotool") is None or shutil.which("import") is None:
-        log.info("FreeRDP fallback not available (missing tools) freerdp=%s", freerdp)
+    xd = shutil.which("xdotool")
+    imp = shutil.which("import")
+    xv = shutil.which("Xvfb")
+    if freerdp is None or xd is None or imp is None:
+        log.warning("FreeRDP fallback missing: freerdp=%s xdotool=%s import=%s Xvfb=%s PATH=%s", freerdp, xd, imp, xv, os.environ.get("PATH"))
+        # also try to list /usr/bin/*freerdp* for debugging
+        try:
+            import glob
+            freerdps = glob.glob("/usr/bin/*freerdp*")
+            log.warning("glob /usr/bin/*freerdp*: %s", freerdps)
+        except: pass
         return None
     if not await _ensure_xvfb():
         return None
