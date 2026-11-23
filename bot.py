@@ -921,12 +921,16 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             log.warning("glob /usr/bin/*freerdp*: %s", freerdps)
         except: pass
         # Fallback without FreeRDP: try simple-rdp methods (Win+R and Run app)
-        # Try 1: Win+R via simple-rdp (may work even when Start blocked)
-        # Try 2: Start -> Run app
+        # Take base screenshot first
+        try:
+            desktop_simple = await mgr.screenshot()
+        except Exception as e:
+            log.warning("fallback base screenshot fail: %s", e)
+            return f"Not found: {word}"
         for method in ["win+r", "run"]:
             try:
                 log.info("Trying simple-rdp fallback method %s for %r", method, word)
-                base = desktop
+                base = desktop_simple
                 if method == "win+r":
                     # Direct Win+R
                     await mgr.execute([("key", "win+r"), ("wait", 1.2)])
@@ -953,7 +957,40 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             except Exception as e:
                 log.warning("simple fallback %s failed: %s", method, e)
                 continue
-        return f"Not found: {word}" if method == "run" else None
+        # Try 3: Task Manager -> File -> Run new task (bypasses Start/Run block)
+        try:
+            log.info("Trying Task Manager fallback for %r", word)
+            base2 = desktop_simple
+            # Ctrl+Shift+Esc
+            await mgr.execute([("key", "ctrl+shift+esc"), ("wait", 2.0)])
+            tm = await mgr.screenshot()
+            r_tm = diff_ratio(base2, tm)
+            log.info("taskmgr open diff %.3f", r_tm)
+            if r_tm > 0.02:
+                # Alt+F -> N (Run new task) or File->Run new task
+                await mgr.execute([("key", "alt+f"), ("wait", 0.5)])
+                await asyncio.sleep(0.3)
+                # try n for new task
+                await mgr.execute([("key", "n"), ("wait", 0.8)])
+                await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+                await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 3.0)])
+                after_tm = await mgr.screenshot()
+                r = diff_ratio(base2, after_tm)
+                from PIL import ImageChops, ImageOps
+                a = ImageOps.grayscale(base2); b = ImageOps.grayscale(after_tm)
+                if a.size != b.size: b = b.resize(a.size)
+                hist = ImageChops.difference(a,b).histogram()
+                r10 = sum(hist[10:])/(a.size[0]*a.size[1])
+                log.info("taskmgr fallback %r -> diff %.3f thr10 %.3f", word, r, r10)
+                # clean up taskmgr
+                await mgr.execute([("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.5)])
+                if r > 0.02 or r10 > 0.03:
+                    return f"Opened: {word}"
+            else:
+                await mgr.execute([("key", "escape"), ("wait", 0.5)])
+        except Exception as e:
+            log.warning("taskmgr fallback failed: %s", e)
+        return f"Not found: {word}"
     if not await _ensure_xvfb():
         return None
     cfg = mgr.cfg
@@ -1216,8 +1253,18 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("cmd_run %r via FreeRDP/simple", word)
         fb = await _win_via_freerdp(mgr, word)
         if fb is not None:
-            # fb already is Opened/Not found via Run dialog (FreeRDP or simple fallback)
-            await update.message.reply_text(fb + " (via Run dialog)")
+            if "Opened" in fb:
+                await update.message.reply_text(fb + " (via Run dialog)")
+                return
+            # Not found for chrome -> try msedge/candidates automatically (tally has no chrome)
+            if word.lower() in ("chrome","chrome.exe","google chrome"):
+                for cand in ["msedge","msedge.exe","explorer"]:
+                    log.info("chrome not found, trying fallback cand %r", cand)
+                    fb2 = await _win_via_freerdp(mgr, cand)
+                    if fb2 and "Opened" in fb2:
+                        await update.message.reply_text(fb2 + f" (tried {cand} for chrome)" )
+                        return
+            await update.message.reply_text(fb + " (via Run dialog) — try /run msedge or /run explorer if chrome not installed")
             return
         # Last resort: try simple-rdp direct open (no FreeRDP) — works for many apps
         try:
