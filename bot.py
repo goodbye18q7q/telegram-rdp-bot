@@ -95,6 +95,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /goto instagram.com — open a URL directly
 /instagram — open Instagram directly
 /iglogin — bot-assisted one-time Instagram login (private chat only)
+/igotp <code> — submit Instagram's one-time verification code
 /install adblock — open the Chrome Web Store
 /cmd ipconfig — run a command in PowerShell
 /type hello — type text (unicode works too)
@@ -1528,6 +1529,45 @@ async def cmd_ctrl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @guarded
+async def cmd_igotp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Submit an Instagram verification code once, after deleting its chat message."""
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    session = ig_login_sessions.get(chat_id)
+    if not session or session.get("step") != "otp":
+        await update.message.reply_text("Pehle /iglogin flow chalao aur Instagram OTP prompt aane do.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("🔒 OTP sirf bot ke private DM mein bhejo.")
+        return
+    code = "".join(context.args or []).strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]{4,12}", code):
+        await update.message.reply_text("Usage: /igotp <4–12 character OTP or backup code>")
+        return
+    try:
+        await update.message.delete()
+    except Exception:
+        await update.message.reply_text("🔒 OTP message delete nahi hua, isliye code submit nahi kiya. Message khud delete karke /igotp dobara bhejo.")
+        return
+
+    ig_login_sessions.pop(chat_id, None)
+    try:
+        mgr = get_mgr()
+        if not mgr.is_connected:
+            await update.effective_chat.send_message("❌ RDP disconnected hai; OTP submit nahi hua. /connect karke flow dobara chalao.")
+            return
+        width, height = mgr.client.width, mgr.client.height
+        await mgr.execute([
+            ("click", int(width * 0.75), int(height * 0.35), 1, False),
+            ("wait", 0.2), ("key", "ctrl+a"), ("text", code), ("wait", 0.3),
+            ("click", int(width * 0.75), int(height * 0.54), 1, False), ("wait", 5.0),
+        ])
+        await update.effective_chat.send_message("✅ Verification code submit kiya. /screen bhejo aur result check karo.")
+    except Exception:
+        log.exception("Instagram OTP automation failed")
+        await update.effective_chat.send_message("❌ OTP submit nahi ho paya. /screen bhejo; code save nahi hua.")
+
+
+@guarded
 async def cmd_iglogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open Instagram and begin a private, one-shot credential entry flow."""
     uid = update.effective_user.id if update.effective_user else 0
@@ -1574,6 +1614,11 @@ async def _handle_ig_login_message(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Ab password bhejo. Password message ko main turant delete karne ki koshish karunga.")
         return True
 
+    # Once submitted, accept an optional OTP only through /igotp; ordinary
+    # messages and bot commands must continue to work while awaiting a challenge.
+    if session.get("step") == "otp":
+        return False
+
     # Keep the password only in this local variable; don't put it in user_data,
     # a file, a log, or a reply. Remove the session before any remote operations.
     password = update.message.text
@@ -1607,8 +1652,10 @@ async def _handle_ig_login_message(update: Update, context: ContextTypes.DEFAULT
             ("wait", 5.0),
         ])
         password = ""
+        ig_login_sessions[chat_id] = {"step": "otp"}
         await update.effective_chat.send_message(
-            "✅ Login details submit kar diye. Ab /screen bhejo; agar Instagram OTP/approval maange, woh RDP screen par complete karo."
+            "✅ Login details submit kar diye. Agar Instagram OTP maange, `/igotp CODE` bhejo—code message delete karke submit karunga. "
+            "Agar OTP na aaye to /cancel bhej do. Approval/2FA prompt alag ho to /screen check karo."
         )
     except Exception:
         password = ""
@@ -1729,6 +1776,7 @@ def main() -> None:
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("iglogin", cmd_iglogin))
+    app.add_handler(CommandHandler("igotp", cmd_igotp))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("ui", cmd_ui))
     app.add_handler(CommandHandler("keyboard", cmd_ui))
