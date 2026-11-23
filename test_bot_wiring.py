@@ -107,6 +107,18 @@ class TestWiring(BotTestCase):
         self.assertIn("Error", msg.reply_text.await_args[0][0])
 
 
+class TestWebNavigation(BotTestCase):
+    def test_full_windows_rdp_uses_browser_address_bar_not_start_search(self):
+        fake = self.use_fake()
+        result = asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "windows-rdp"))
+        actions = fake.execute.await_args[0][0]
+        self.assertIn(("key", "ctrl+l"), actions)
+        self.assertIn(("key", "escape"), actions)
+        self.assertNotIn(("key", "ctrl+esc"), actions)
+        self.assertEqual([a[1] for a in actions if a[0] == "text"], ["https://www.instagram.com"])
+        self.assertIn("current browser", result)
+
+
 class TestProfiles(BotTestCase):
     def test_add_and_list(self):
         update, msg = make_update("/add RDP1 1.2.3.4:65430 admin pw123")

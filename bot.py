@@ -295,6 +295,24 @@ BROWSER_CANDIDATES = [
 ]
 
 
+async def _open_url_for_profile(mgr, url: str, host: str | None = None) -> str | None:
+    """Open a URL without routing it through Windows Start search on full desktops."""
+    host = host or current.get("host", "")
+    if host == "103.76.214.2":
+        return await _open_browser_via_run(mgr, url)
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    # On ordinary Windows RDP, Edge is already open. Escape out of any Start
+    # search overlay, focus the browser address bar, replace all text, navigate.
+    await mgr.execute([
+        ("key", "escape"), ("wait", 0.2),
+        ("key", "escape"), ("wait", 0.2),
+        ("key", "ctrl+l"), ("wait", 0.3), ("key", "ctrl+a"),
+        ("text", url), ("wait", 0.3), ("key", "enter"), ("wait", 4.0),
+    ])
+    return f"Navigation command sent to the current browser for {url}"
+
+
 async def _open_browser_via_run(mgr, url: str | None = None) -> str | None:
     """Tally RemoteApp pe chrome kholne ka robust tareeka — multiple candidates try."""
     # Tally host is a RemoteApp shell: Win+R/Start keys can leak a stray "r"
@@ -1452,20 +1470,13 @@ async def on_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             title, url = results[idx]
         mgr = get_mgr()
         await query.edit_message_text(f"⏳ Opening in RDP: {url[:80]}...")
-        # Robust open: try browser candidates with url
-        # Use _open_browser_via_run if tally, else simple goto
-        host = current.get("host","")
-        if host == "103.76.214.2":
-            res = await _open_browser_via_run(mgr, url)
-            if res:
-                await query.message.reply_text(res + f" — {url}")
-            else:
-                # fallback to simple goto via chrome
-                await mgr.execute(commands.a_goto(url))
-                await query.message.reply_text(f"✅ Opening: {url}")
+        host = current.get("host", "")
+        res = await _open_url_for_profile(mgr, url, host)
+        if res and "Not found" not in res:
+            prefix = "✅" if host == "103.76.214.2" else "⏳"
+            await query.message.reply_text(f"{prefix} {res} — /screen bhejo confirm karo")
         else:
-            await mgr.execute(commands.a_goto(url))
-            await query.message.reply_text(f"✅ Opening: {url}\n/screen bhejo dekho")
+            await query.message.reply_text(f"❌ URL open confirm nahi hua: {url} — /screen bhejo")
     except Exception as e:
         log.exception("search callback failed")
         try: await query.message.reply_text(f"❌ Error: {e}")
@@ -1580,10 +1591,14 @@ async def cmd_iglogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.effective_chat.id
     try:
         mgr = get_mgr()
-        await mgr.execute(commands.a_goto("https://www.instagram.com/accounts/login/"))
+        host = current.get("host", "")
+        opened = await _open_url_for_profile(mgr, "https://www.instagram.com/accounts/login/", host)
+        if not opened or "Not found" in opened:
+            await update.message.reply_text("❌ Instagram page khulna confirm nahi hua. /screen bhejo aur RDP browser check karo.")
+            return
         ig_login_sessions[chat_id] = {"step": "username"}
         await update.message.reply_text(
-            "Instagram login page khol diya. Ab isi private chat mein username bhejo, phir password. "
+            "Instagram login page par navigation command bhej diya. /screen se page check karo; phir isi private chat mein username bhejo, uske baad password. "
             "Password message ko bot enter karne se pehle delete karne ki koshish karega; agar delete fail hua to login submit nahi karega. "
             "Credentials save nahi honge. /cancel se flow rok sakte ho."
         )
@@ -1715,14 +1730,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             try:
                 mgr = get_mgr()
                 await update.message.reply_text(f"⏳ Opening {idx+1}: {title}\n{url}")
-                host = current.get("host","")
-                if host == "103.76.214.2":
-                    res = await _open_browser_via_run(mgr, url)
-                    if not res or "Not found" in res:
-                        await mgr.execute(commands.a_goto(url))
+                host = current.get("host", "")
+                res = await _open_url_for_profile(mgr, url, host)
+                if not res or "Not found" in res:
+                    await update.message.reply_text(f"❌ Open confirm nahi hua: {title} — /screen bhejo")
                 else:
-                    await mgr.execute(commands.a_goto(url))
-                await update.message.reply_text(f"✅ Opened: {title}")
+                    prefix = "✅" if host == "103.76.214.2" else "⏳"
+                    await update.message.reply_text(f"{prefix} {title}: {res} — /screen bhejo confirm karo")
             except Exception as e:
                 await update.message.reply_text(f"❌ Error: {e}")
             return
@@ -1742,6 +1756,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         actions, desc = commands.parse_command(text)
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}\n\nType /start to see the commands.")
+        return
+
+    # Website aliases/URLs should go straight to the current browser on full
+    # Windows desktops, not into the Start-menu search box via Ctrl+Esc.
+    target_url = None
+    if desc.startswith("Opening:"):
+        target_url = desc.split(":", 1)[1].strip()
+    elif desc.startswith("Opening "):
+        site = desc[len("Opening "):].strip().lower()
+        target_url = commands.WEB_ALIASES.get(site)
+    if target_url:
+        try:
+            host = current.get("host", "")
+            res = await _open_url_for_profile(get_mgr(), target_url, host)
+            if not res or "Not found" in res:
+                await update.message.reply_text(f"❌ Open command fail hua: {target_url} — /screen bhejo")
+            else:
+                prefix = "✅" if host == "103.76.214.2" else "⏳"
+                await update.message.reply_text(f"{prefix} {res} — /screen bhejo confirm karo")
+        except Exception as e:
+            log.exception("website navigation failed")
+            await update.message.reply_text(f"❌ Website open failed: {e}")
         return
 
     try:
