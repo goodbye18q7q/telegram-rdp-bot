@@ -293,17 +293,22 @@ BROWSER_CANDIDATES = [
 
 async def _open_browser_via_run(mgr, url: str | None = None) -> str | None:
     """Tally RemoteApp pe chrome kholne ka robust tareeka — multiple candidates try."""
-    # url None -> blank chrome, else specific url
+    # Tally host is a RemoteApp shell: Win+R/Start keys can leak a stray "r"
+    # into an already-open task dialog. Chrome is confirmed installed there, so
+    # run exactly one command through the mouse-driven Task Manager path.
+    if mgr.cfg.get("rdp_host") == "103.76.214.2":
+        app = "chrome" if not url else f"chrome {url}"
+        log.info("Tally search: single Task Manager launch %r", app)
+        return await _win_via_freerdp(mgr, app)
+    # Other hosts: retain candidate fallback.
     for cand in BROWSER_CANDIDATES:
         app = cand if url is None else f'{cand} {url}' if "://" not in cand else cand
-        # For path with spaces, need quotes
         if url and " " in cand:
             app = f'"{cand}" {url}'
         log.info("try browser candidate %r", app)
         res = await _win_via_freerdp(mgr, app)
         if res and "Opened" in res:
             return res
-        # also try simple execute fallback for that candidate (if not FreeRDP)
         await asyncio.sleep(0.8)
     return None
 
@@ -924,10 +929,17 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
         # Take base screenshot first
         try:
             desktop_simple = await mgr.screenshot()
+            if mgr.cfg.get("rdp_host") == "103.76.214.2":
+                # Recover cleanly if a prior attempt left Create new task open.
+                await mgr.execute([("key", "escape"), ("wait", 0.4)])
+                desktop_simple = await mgr.screenshot_nowait()
         except Exception as e:
             log.warning("fallback base screenshot fail: %s", e)
             return f"Not found: {word}"
-        for method in ["win+r", "run"]:
+        # Tally's RemoteApp swallows Win+R; go straight to the verified mouse-driven
+        # Task Manager flow instead of typing a stray "r" into an existing dialog.
+        methods = [] if mgr.cfg.get("rdp_host") == "103.76.214.2" else ["win+r", "run"]
+        for method in methods:
             try:
                 log.info("Trying simple-rdp fallback method %s for %r", method, word)
                 base = desktop_simple
