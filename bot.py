@@ -1264,7 +1264,11 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     if fb2 and "Opened" in fb2:
                         await update.message.reply_text(fb2 + f" (tried {cand} for chrome)" )
                         return
-            await update.message.reply_text(fb + " (via Run dialog) — try /run msedge or /run explorer if chrome not installed")
+            # Tally RemoteApp blocks browsers - give clear hint
+            if current.get("host")=="103.76.214.2":
+                await update.message.reply_text(fb + " (via Run dialog)\n⚠️ Ye Tally RemoteApp server browsers ko block karta hai. Sirf TallyPrime allowed hai. Chrome/Edge yahan install hi nahi ya policy blocked hai.\nTry: /run calc, /run notepad — ye bhi blocked hai (tested). Browser ke liye dusra RDP 103.127.30.214:3330 use karo — wahan /search aur chrome pura working hai.")
+            else:
+                await update.message.reply_text(fb + " (via Run dialog) — try /run msedge or /run explorer if chrome not installed")
             return
         # Last resort: try simple-rdp direct open (no FreeRDP) — works for many apps
         try:
