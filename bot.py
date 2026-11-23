@@ -958,38 +958,59 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                 log.warning("simple fallback %s failed: %s", method, e)
                 continue
         # Try 3: Task Manager -> File -> Run new task (bypasses Start/Run block)
+        # FIX: compare FINAL (after closing TM) vs BASE, not intermediate TM diff
         try:
             log.info("Trying Task Manager fallback for %r", word)
             base2 = desktop_simple
-            # Ctrl+Shift+Esc
             await mgr.execute([("key", "ctrl+shift+esc"), ("wait", 2.0)])
             tm = await mgr.screenshot()
             r_tm = diff_ratio(base2, tm)
             log.info("taskmgr open diff %.3f", r_tm)
             if r_tm > 0.02:
-                # Alt+F -> N (Run new task) or File->Run new task
                 await mgr.execute([("key", "alt+f"), ("wait", 0.5)])
                 await asyncio.sleep(0.3)
-                # try n for new task
                 await mgr.execute([("key", "n"), ("wait", 0.8)])
-                await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
-                await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 3.0)])
-                after_tm = await mgr.screenshot()
-                r = diff_ratio(base2, after_tm)
-                from PIL import ImageChops, ImageOps
-                a = ImageOps.grayscale(base2); b = ImageOps.grayscale(after_tm)
-                if a.size != b.size: b = b.resize(a.size)
-                hist = ImageChops.difference(a,b).histogram()
-                r10 = sum(hist[10:])/(a.size[0]*a.size[1])
-                log.info("taskmgr fallback %r -> diff %.3f thr10 %.3f", word, r, r10)
-                # clean up taskmgr
-                await mgr.execute([("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.5)])
-                if r > 0.02 or r10 > 0.03:
-                    return f"Opened: {word}"
+                # Check if 'Create new task' dialog appeared
+                dlg = await mgr.screenshot()
+                r_dlg = diff_ratio(tm, dlg)
+                log.info("taskmgr dialog diff vs tm %.3f", r_dlg)
+                if r_dlg < 0.01:
+                    log.info("Create new task dialog not opened for %r (r_dlg %.3f), abort taskmgr path", word, r_dlg)
+                    await mgr.execute([("key", "escape"), ("wait", 0.5), ("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.5)])
+                else:
+                    await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+                    await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 3.0)])
+                    # Close Task Manager first, then check if app stayed open
+                    await mgr.execute([("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.8)])
+                    await asyncio.sleep(0.5)
+                    final = await mgr.screenshot()
+                    r = diff_ratio(base2, final)
+                    from PIL import ImageChops, ImageOps
+                    a = ImageOps.grayscale(base2); b = ImageOps.grayscale(final)
+                    if a.size != b.size: b = b.resize(a.size)
+                    hist = ImageChops.difference(a,b).histogram()
+                    r10 = sum(hist[10:])/(a.size[0]*a.size[1])
+                    log.info("taskmgr final %r -> diff vs base %.3f thr10 %.3f (dlg was %.3f)", word, r, r10, r_dlg)
+                    if r > 0.02 or r10 > 0.03:
+                        # Verify it's not just black/signout screen
+                        from PIL import Image
+                        # brightness check - black screen = failure
+                        try:
+                            bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
+                            if bright < 0.05:
+                                log.info("taskmgr final is black, treat as Not found")
+                            else:
+                                return f"Opened: {word}"
+                        except:
+                            return f"Opened: {word}"
+                    # also ensure we cleaned up
             else:
                 await mgr.execute([("key", "escape"), ("wait", 0.5)])
         except Exception as e:
             log.warning("taskmgr fallback failed: %s", e)
+            try:
+                await mgr.execute([("key", "alt+f4"), ("wait", 0.5), ("key", "escape"), ("wait", 0.5)])
+            except: pass
         return f"Not found: {word}"
     if not await _ensure_xvfb():
         return None
