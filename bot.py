@@ -12,7 +12,12 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
+import time
+from urllib.parse import parse_qs
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 
@@ -53,6 +58,7 @@ managers: dict[str, RDPManager] = {}
 connect_sessions: dict[int, dict] = {}
 
 OPENED_RATIO = 0.05
+FREERDP_LOCK = asyncio.Lock()
 
 HELP_TEXT = """🤖 RDP Control Bot — multi profile
 
@@ -67,6 +73,8 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /status                       — active profile + connection status
 /cancel                       — cancel the connect flow
 /screen                       — photo of the active desktop
+/fix                          — black screen fix (disconnect + reconnect)
+/ui /keyboard /mouse           — virtual keyboard + mouse (web UI)
 
 ⌨️ Commands (they act on the ACTIVE profile):
 /win chrome — Start menu search (auto fallback to Win+R on RemoteApp servers like 103.76.214.2)
@@ -205,28 +213,239 @@ def mean_brightness(img) -> float:
     return sum(i * c for i, c in enumerate(hist)) / total
 
 
+UI_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>RDP Virtual Control</title>
+<style>
+*{box-sizing:border-box;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+body{margin:0;background:#0f1115;color:#e6e6e6}
+header{padding:12px 16px;background:#161a22;border-bottom:1px solid #222;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+header h1{margin:0;font-size:16px;flex:1}
+select,button,input{border-radius:8px;border:1px solid #333;background:#1e2330;color:#e6e6e6;padding:8px 10px;font-size:13px}
+button{cursor:pointer;background:#2a56ff;border-color:#2a56ff}
+button:active{opacity:0.8}
+button.secondary{background:#1e2330}
+button.small{padding:6px 8px;font-size:12px}
+.layout{max-width:1100px;margin:auto;padding:12px;display:grid;gap:12px}
+.card{background:#161a22;border:1px solid #232836;border-radius:12px;padding:12px}
+.card h3{margin:0 0 8px 0;font-size:13px;opacity:0.9}
+.screen-wrap{position:relative;background:#000;border-radius:10px;overflow:hidden;border:1px solid #333;touch-action:none}
+.screen-wrap img{width:100%;height:auto;display:block}
+#pad{height:170px;background:radial-gradient(circle at 30% 30%,#1a2035,#0f1115);border:1px dashed #333;border-radius:10px;display:flex;align-items:center;justify-content:center;user-select:none;touch-action:none;position:relative;overflow:hidden}
+#pad::after{content:"◉ drag / tap = move + click";position:absolute;bottom:6px;font-size:11px;opacity:0.6}
+.kbd{display:grid;gap:4px}
+.kbd .row{display:flex;gap:4px;flex-wrap:wrap}
+.kbd button{flex:1;min-width:28px;padding:10px 4px;font-size:13px}
+.kbd button.extra{background:#212837}
+.row-actions{display:flex;gap:6px;flex-wrap:wrap}
+input[type=text]{flex:1;min-width:160px}
+.dot{width:8px;height:8px;border-radius:50%;background:#ff3b30;display:inline-block}
+.dot.ok{background:#30d158}
+.help{font-size:12px;opacity:0.7;line-height:1.4}
+</style></head><body>
+<header><h1>🖥️ RDP Virtual — <span id="profLabel">-</span> <span id="dot" class="dot"></span></h1>
+<select id="profile"></select>
+<button id="btnScreen" class="secondary">📸 Refresh</button>
+<button id="btnFix" class="secondary">🛠️ Fix Black</button>
+<a href="/health" target="_blank" style="font-size:12px;opacity:0.6;color:#8ab4ff;text-decoration:none">health</a>
+</header>
+<div class="layout">
+<div class="card">
+<h3>Screen (tap to click, drag to move)</h3>
+<div class="screen-wrap" id="screenWrap"><img id="screen" alt="screen"><div id="loading" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.6)">Loading…</div></div>
+<div class="row-actions" style="margin-top:8px">
+<button class="secondary small" onclick="sendClick('left')">Left Click</button>
+<button class="secondary small" onclick="sendClick('right')">Right Click</button>
+<button class="secondary small" onclick="sendClick('double')">Double</button>
+<button class="secondary small" onclick="doScroll('up')">Scroll ↑</button>
+<button class="secondary small" onclick="doScroll('down')">Scroll ↓</button>
+<span id="pos" style="font-size:11px;opacity:0.6;margin-left:6px"></span>
+</div>
+</div>
+<div class="card">
+<h3>Mouse Pad (trackpad jaisa)</h3>
+<div id="pad"></div>
+<div class="row-actions" style="margin-top:8px">
+<button class="secondary small" onclick="sendKey('escape')">Esc</button>
+<button class="secondary small" onclick="sendKey('alt+f4')">Alt+F4</button>
+<button class="secondary small" onclick="sendKey('win+r')">Win+R</button>
+<button class="secondary small" onclick="sendKey('ctrl+esc')">Ctrl+Esc</button>
+<button class="secondary small" onclick="sendKey('alt+tab')">Alt+Tab</button>
+</div>
+</div>
+<div class="card">
+<h3>Virtual Keyboard + Type</h3>
+<div style="display:flex;gap:6px;margin-bottom:8px">
+<input id="typeBox" type="text" placeholder="Yahan type karo">
+<button onclick="sendType()">Type ↵</button>
+<button class="secondary" onclick="sendKey('ctrl+a')">Ctrl+A</button>
+<button class="secondary" onclick="sendKey('backspace')">⌫</button>
+<button class="secondary" onclick="sendKey('enter')">Enter</button>
+</div>
+<div class="kbd" id="kbd"></div>
+<div class="row-actions" style="margin-top:8px">
+<button class="secondary small" onclick="quickRun('calc')">Run calc</button>
+<button class="secondary small" onclick="quickRun('notepad')">Run notepad</button>
+<button class="secondary small" onclick="quickRun('mspaint')">Run mspaint</button>
+<button class="secondary small" onclick="quickRun('explorer')">Explorer</button>
+</div>
+<p class="help">RemoteApp (103.76…) pe Run calc/notepad hi kaam karega — Chrome install nahi hai. Black screen aaye to Fix Black dabao.</p>
+</div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const profileSel=$("#profile"), profLabel=$("#profLabel"), dot=$("#dot"), screen=$("#screen"), wrap=$("#screenWrap"), loading=$("#loading"), pos=$("#pos"), pad=$("#pad"), typeBox=$("#typeBox");
+let prof=""; let w=1366,h=768;
+async function api(path, opts){ const r=await fetch(path, opts); const t=await r.text(); try{return JSON.parse(t)}catch{return t} }
+async function loadProfiles(){ const j=await api("/api/status"); const sel=j.profiles||[]; const cur=j.current||{}; profileSel.innerHTML=sel.map(p=>`<option value="${p.name}">${p.name} — ${p.host}:${p.port} ${p.connected?"🟢":"⚪"}</option>`).join("")||`<option value="">(no profile)</option>`; if(cur.name) profileSel.value=cur.name; prof=profileSel.value||cur.name||sel[0]?.name||""; profLabel.textContent=prof||"-"; dot.className="dot "+(sel.find(x=>x.name===prof)?.connected?"ok":""); w=cur.width||1366; h=cur.height||768; if(prof) refresh(); }
+profileSel.onchange=()=>{ prof=profileSel.value; profLabel.textContent=prof; refresh(); };
+async function refresh(){ if(!prof) return; loading.style.display="flex"; try{ const r=await fetch(`/api/screen?profile=${encodeURIComponent(prof)}&t=${Date.now()}`); if(r.ok){ const b=await r.blob(); screen.src=URL.createObjectURL(b); } }catch(e){} loading.style.display="none"; }
+$("#btnScreen").onclick=refresh; $("#btnFix").onclick=async()=>{ if(!prof) return; $("#btnFix").textContent="Fixing…"; await api("/api/fix?profile="+encodeURIComponent(prof),{method:"POST"}); $("#btnFix").textContent="🛠️ Fix Black"; setTimeout(refresh,1200); };
+async function exec(actions){ if(!prof) return alert("profile select karo"); await api("/api/exec",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({profile:prof,actions})}); setTimeout(refresh,600); }
+function sendKey(combo){ exec([{key:combo}]); }
+function sendType(){ const v=typeBox.value; if(!v) return; exec([{text:v}]); typeBox.value=""; }
+typeBox.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); sendType(); }});
+function sendClick(which){ exec([{move:[Math.floor(w/2),Math.floor(h/2)]},{click:which}]); }
+function doScroll(dir){ exec([{scroll:[dir,3]}]); }
+function quickRun(app){ exec([{key:"win+r"},{wait:0.8},{text:app},{key:"enter"}]); }
+wrap.addEventListener("click", e=>{
+  const imgRect=screen.getBoundingClientRect();
+  const x = Math.round((e.clientX - imgRect.left) / imgRect.width * w);
+  const y = Math.round((e.clientY - imgRect.top) / imgRect.height * h);
+  pos.textContent = `click ${x},${y}`;
+  exec([{move:[x,y]},{click:"left"}]);
+});
+let dragging=false, lastX=0,lastY=0, curX=w/2, curY=h/2;
+function padPos(e){ const r=pad.getBoundingClientRect(); const t=e.touches?e.touches[0]:e; return {x: t.clientX-r.left, y: t.clientY-r.top}; }
+pad.addEventListener("mousedown", e=>{ dragging=true; const p=padPos(e); lastX=p.x; lastY=p.y; e.preventDefault(); });
+pad.addEventListener("touchstart", e=>{ dragging=true; const p=padPos(e); lastX=p.x; lastY=p.y; e.preventDefault(); }, {passive:false});
+window.addEventListener("mouseup", ()=>dragging=false);
+window.addEventListener("touchend", ()=>dragging=false);
+pad.addEventListener("mousemove", e=>{ if(!dragging) return; const p=padPos(e); const dx=p.x-lastX, dy=p.y-lastY; lastX=p.x; lastY=p.y; curX=Math.max(0,Math.min(w,curX+dx*(w/pad.clientWidth)*1.8)); curY=Math.max(0,Math.min(h,curY+dy*(h/pad.clientHeight)*1.8)); exec([{move:[Math.round(curX),Math.round(curY)}]); pos.textContent=`pad ${Math.round(curX)},${Math.round(curY)}`; });
+pad.addEventListener("touchmove", e=>{ if(!dragging) return; const p=padPos(e); const dx=p.x-lastX, dy=p.y-lastY; lastX=p.x; lastY=p.y; curX=Math.max(0,Math.min(w,curX+dx*(w/pad.clientWidth)*1.8)); curY=Math.max(0,Math.min(h,curY+dy*(h/pad.clientHeight)*1.8)); exec([{move:[Math.round(curX),Math.round(curY)}]); e.preventDefault(); }, {passive:false});
+const rows=[ ["q","w","e","r","t","y","u","i","o","p"], ["a","s","d","f","g","h","j","k","l"], ["z","x","c","v","b","n","m"], ["1","2","3","4","5","6","7","8","9","0"] ];
+const kbd=$("#kbd");
+rows.forEach(r=>{
+  const div=document.createElement("div"); div.className="row";
+  r.forEach(k=>{ const b=document.createElement("button"); b.textContent=k; b.onclick=()=>exec([{text:k}]); div.appendChild(b); });
+  kbd.appendChild(div);
+});
+const special=["Escape","Tab","Backspace","Enter","Space","Shift","Ctrl","Alt","Win","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","F1","F2","F5","Delete"];
+const div=document.createElement("div"); div.className="row";
+special.forEach(k=>{ const b=document.createElement("button"); b.textContent=k; b.className="extra"; b.style.fontSize="11px"; b.onclick=()=>{ const map={Space:"space",Escape:"escape",Delete:"delete"}; sendKey(map[k]||k.toLowerCase()); }; div.appendChild(b); });
+kbd.appendChild(div);
+loadProfiles(); setInterval(()=>{ if(document.visibilityState==="visible") loadProfiles(); }, 8000);
+</script></body></html>
+"""
+
 def start_health_server() -> None:
-    """Tiny HTTP server — health check / free-tier keep-alive ping.
-
-    Render free web services sleep after 15 min of inactivity. A free service
-    like UptimeRobot (or the GitHub Actions workflow in this repo) pings this
-    URL every 5 minutes so the service stays awake.
-    """
     port = int(os.environ.get("PORT", "10000"))
-
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 (http.server API)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, *args):
-            pass  # keep it quiet
-
+        def do_GET(self):
+            try:
+                parsed = urlparse(self.path)
+                path = parsed.path
+                qs = parse_qs(parsed.query)
+                if path in ("/health", "/ok"):
+                    self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"ok"); return
+                if path == "/ui" or path == "/":
+                    if path == "/" and "uptimerobot" in self.headers.get("User-Agent","").lower():
+                        self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"ok"); return
+                    self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.end_headers(); self.wfile.write(UI_HTML.encode()); return
+                if path == "/api/status":
+                    data = {"profiles": [{"name":k,"host":v.get("host"),"port":v.get("port"),"user":v.get("user"),"connected": (managers.get(k) and managers[k].is_connected)} for k,v in profiles.items()], "current": {"name": current.get("name"), "host": current.get("host"), "port": current.get("port"), "width": cfg.get("rdp_width",1366), "height": cfg.get("rdp_height",768)}}
+                    self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(json.dumps(data).encode()); return
+                if path == "/api/screen":
+                    prof = (qs.get("profile") or [None])[0]
+                    key = (prof or current.get("name") or "").lower()
+                    mgr = managers.get(key)
+                    if not mgr or not mgr.is_connected:
+                        try: mgr = get_mgr(prof) if prof else get_mgr()
+                        except Exception as e: self.send_response(404); self.send_header("Content-Type","application/json"); self.end_headers(); self.wfile.write(json.dumps({"error":str(e)}).encode()); return
+                    try:
+                        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                        img = loop.run_until_complete(mgr.screenshot())
+                        buf = io.BytesIO(); img.save(buf, format="PNG"); data = buf.getvalue()
+                        self.send_response(200); self.send_header("Content-Type","image/png"); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(data)
+                        loop.close()
+                    except Exception as e: self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers(); self.wfile.write(json.dumps({"error":str(e)}).encode())
+                    return
+                if path == "/api/run":
+                    prof = (qs.get("profile") or [None])[0]
+                    appname = (qs.get("app") or ["calc"])[0]
+                    async def _run():
+                        m = get_mgr(prof) if prof else get_mgr()
+                        return await _win_via_freerdp(m, appname)
+                    try:
+                        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                        res = loop.run_until_complete(_run()); loop.close()
+                        self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(json.dumps({"result":res}).encode())
+                    except Exception as e: self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers(); self.wfile.write(json.dumps({"error":str(e)}).encode())
+                    return
+                self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"ok")
+            except Exception as e:
+                try: self.send_response(500); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(str(e).encode())
+                except: pass
+        def do_POST(self):
+            try:
+                parsed = urlparse(self.path)
+                path = parsed.path
+                length = int(self.headers.get("Content-Length",0))
+                body = self.rfile.read(length) if length else b""
+                if path == "/api/exec":
+                    try: data = json.loads(body.decode() or "{}")
+                    except: data = {}
+                    prof = data.get("profile")
+                    actions = data.get("actions") or []
+                    norm = []
+                    for a in actions:
+                        if "key" in a: norm.append(("key", a["key"]))
+                        elif "text" in a: norm.append(("text", a["text"]))
+                        elif "move" in a: norm.append(("move", tuple(a["move"])))
+                        elif "click" in a:
+                            c = a["click"]
+                            if c=="right": norm.append(("click","right"))
+                            elif c=="double": norm.append(("click","double"))
+                            else: norm.append(("click","left"))
+                        elif "scroll" in a: norm.append(("scroll", tuple(a["scroll"])))
+                        elif "wait" in a: norm.append(("wait", float(a["wait"])))
+                    async def _exec():
+                        m = get_mgr(prof) if prof else get_mgr()
+                        await m.execute(norm)
+                        return True
+                    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                    loop.run_until_complete(_exec()); loop.close()
+                    self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(b'{"ok":true}')
+                    return
+                if path == "/api/fix":
+                    qs = parse_qs(parsed.query)
+                    prof = (qs.get("profile") or [None])[0]
+                    async def _fix():
+                        key = (prof or current.get("name") or "").lower()
+                        m = managers.get(key)
+                        if m:
+                            try: await m.disconnect()
+                            except: pass
+                            await asyncio.sleep(1.0)
+                            await m.connect()
+                            await asyncio.sleep(1.0)
+                            return True
+                        return False
+                    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                    loop.run_until_complete(_fix()); loop.close()
+                    self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers(); self.wfile.write(b'{"ok":true}')
+                    return
+                self.send_response(404); self.end_headers()
+            except Exception as e:
+                try: self.send_response(500); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(str(e).encode())
+                except: pass
+        def do_OPTIONS(self):
+            self.send_response(200); self.send_header("Access-Control-Allow-Origin","*"); self.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS"); self.send_header("Access-Control-Allow-Headers","Content-Type"); self.end_headers()
+        def log_message(self, *args): pass
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Health server listening on :%s", port)
+    log.info("Health+UI server listening on :%s ( /ui virtual keyboard/mouse )", port)
+
 
 
 # Load saved profiles at startup
@@ -835,6 +1054,33 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @guarded
+async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Black screen fix: disconnect + reconnect"""
+    try:
+        mgr = get_mgr()
+        await update.message.reply_text("🔄 Fixing black screen — reconnecting...")
+        try:
+            await mgr.disconnect()
+        except: pass
+        await asyncio.sleep(1.2)
+        await mgr.connect()
+        await asyncio.sleep(1.0)
+        img = await mgr.screenshot()
+        await update.message.reply_text(f"✅ Reconnected — brightness {mean_brightness(img):.0f} — /screen bhejo")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fix failed: {e}")
+
+@guarded
+async def cmd_ui(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or os.environ.get("RENDER_EXTERNAL_URL") or "telegram-rdp-bot.onrender.com"
+    # Render gives https url
+    url = f"https://{host}/ui" if not host.startswith("http") else f"{host}/ui"
+    # fallback
+    if "onrender.com" not in url:
+        url = "https://telegram-rdp-bot.onrender.com/ui"
+    await update.message.reply_text(f"🎮 Virtual Keyboard + Mouse:\n{url}\n\n• Screen pe tap = click\n• Pad drag = mouse move\n• Type box + keyboard\n• Fix Black button\n• Har RDP apne lock me — dusre ko block nahi karega")
+
+@guarded
 async def cmd_edge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open Microsoft Edge."""
     try:
@@ -879,6 +1125,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Plain-text shortcuts
     if low in ("screen", "screenshot", "photo", "desktop photo"):
         return await cmd_screen(update, context)
+    if low in ("fix", "fix black", "black screen"):
+        return await cmd_fix(update, context)
+    if low in ("ui", "keyboard", "mouse", "virtual", "vkbd"):
+        return await cmd_ui(update, context)
     if low in ("connect", "login"):
         context.args = []
         return await cmd_connect(update, context)
@@ -943,6 +1193,10 @@ def main() -> None:
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("fix", cmd_fix))
+    app.add_handler(CommandHandler("ui", cmd_ui))
+    app.add_handler(CommandHandler("keyboard", cmd_ui))
+    app.add_handler(CommandHandler("mouse", cmd_ui))
     app.add_handler(CommandHandler("ctrl", cmd_ctrl))
     app.add_handler(MessageHandler(filters.TEXT, on_message))
 

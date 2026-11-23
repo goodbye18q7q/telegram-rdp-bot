@@ -149,8 +149,14 @@ class RDPManager:
     async def screenshot(self):
         """Remote desktop ki current photo (PIL Image)."""
         await self.ensure()
-        # Screen abhi paint nahi hua to thoda ruko (warna photo black aati hai).
-        await self.wait_for_screen(timeout=10.0)
+        # Screen ready ka wait — 3s hi kaafi hai, 10s bahut slow lagta hai
+        # Black screen aaye to bhi 3s me return (caller /fix se handle karega)
+        await self.wait_for_screen(timeout=3.0)
+        return await self.client.screenshot()
+
+    async def screenshot_nowait(self):
+        """Immediate screenshot without wait — for fast UI refresh"""
+        await self.ensure()
         return await self.client.screenshot()
 
     def status_text(self) -> str:
