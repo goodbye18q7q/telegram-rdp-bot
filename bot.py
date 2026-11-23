@@ -858,10 +858,14 @@ async def cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # Command handlers (act on the ACTIVE profile)
 # ---------------------------------------------------------------------------
 
+def _freerdp_bin():
+    import shutil
+    return shutil.which("xfreerdp3") or shutil.which("xfreerdp") or shutil.which("freerdp3") or None
+
 async def _ensure_xvfb() -> bool:
     """Xvfb :99 chal raha hai ya nahi — agar nahi to start karo (fallback ke liye)."""
     import shutil, subprocess
-    if shutil.which("Xvfb") is None or shutil.which("xfreerdp3") is None:
+    if shutil.which("Xvfb") is None or _freerdp_bin() is None:
         return False
     try:
         # check if :99 already listening
@@ -892,8 +896,9 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
     Returns 'Opened: word' / 'Not found: word' / None (fallback not available).
     """
     import shutil, subprocess, os, time
-    if shutil.which("xfreerdp3") is None or shutil.which("xdotool") is None or shutil.which("import") is None:
-        log.info("FreeRDP fallback not available (missing tools)")
+    freerdp = _freerdp_bin()
+    if freerdp is None or shutil.which("xdotool") is None or shutil.which("import") is None:
+        log.info("FreeRDP fallback not available (missing tools) freerdp=%s", freerdp)
         return None
     if not await _ensure_xvfb():
         return None
@@ -916,13 +921,15 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
     # clean stale FreeRDP instances (consecutive /win calls)
     try:
         subprocess.run(["pkill", "-x", "xfreerdp3"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-x", "xfreerdp"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         await asyncio.sleep(1.2)
     except Exception:
         pass
     try:
-        # start FreeRDP with RDP security (Win+R works there)
+        # start FreeRDP with RDP security (Win+R works there) — use whichever binary exists
+        freerdp_cmd = freerdp  # from above
         proc = subprocess.Popen(
-            ["xfreerdp3", f"/v:{cfg['rdp_host']}:{cfg['rdp_port']}", f"/u:{cfg['rdp_user']}", f"/p:{cfg['rdp_pass']}",
+            [freerdp_cmd, f"/v:{cfg['rdp_host']}:{cfg['rdp_port']}", f"/u:{cfg['rdp_user']}", f"/p:{cfg['rdp_pass']}",
              "/cert:ignore", "/sec:rdp", "/f"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
