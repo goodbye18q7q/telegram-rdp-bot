@@ -61,6 +61,8 @@ managers: dict[str, RDPManager] = {}
 connect_sessions: dict[int, dict] = {}
 # chat_id -> [(title, url), ...] last search results
 search_sessions: dict[int, list[tuple[str, str]]] = {}
+# One-shot Instagram login state; passwords are never stored in this dict.
+ig_login_sessions: dict[int, dict[str, str]] = {}
 
 OPENED_RATIO = 0.05
 FREERDP_LOCK = asyncio.Lock()
@@ -92,6 +94,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /search instagram — shows 1) insta 2) etc → tap 1 to open in RDP Chrome
 /goto instagram.com — open a URL directly
 /instagram — open Instagram directly
+/iglogin — bot-assisted one-time Instagram login (private chat only)
 /install adblock — open the Chrome Web Store
 /cmd ipconfig — run a command in PowerShell
 /type hello — type text (unicode works too)
@@ -823,10 +826,14 @@ async def _handle_connect_step(update: Update, session: dict) -> None:
 @guarded
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if connect_sessions.pop(chat_id, None):
+    cancelled_ig = ig_login_sessions.pop(chat_id, None)
+    cancelled_connect = connect_sessions.pop(chat_id, None)
+    if cancelled_ig:
+        await update.message.reply_text("❌ Instagram login flow cancelled; no Instagram password was retained.")
+    elif cancelled_connect:
         await update.message.reply_text("❌ Connect flow cancelled.")
     else:
-        await update.message.reply_text("No connect flow is running.")
+        await update.message.reply_text("No connect or Instagram login flow is running.")
 
 
 @guarded
@@ -1521,8 +1528,100 @@ async def cmd_ctrl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @guarded
+async def cmd_iglogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open Instagram and begin a private, one-shot credential entry flow."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not cfg["allowed_users"] or uid not in cfg["allowed_users"]:
+        await update.message.reply_text("🔒 /iglogin ke liye ALLOWED_USERS mein apna Telegram user ID set hona zaroori hai.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("🔒 Instagram login sirf bot ke private DM mein start karo.")
+        return
+    chat_id = update.effective_chat.id
+    try:
+        mgr = get_mgr()
+        await mgr.execute(commands.a_goto("https://www.instagram.com/accounts/login/"))
+        ig_login_sessions[chat_id] = {"step": "username"}
+        await update.message.reply_text(
+            "Instagram login page khol diya. Ab isi private chat mein username bhejo, phir password. "
+            "Password message ko bot enter karne se pehle delete karne ki koshish karega; agar delete fail hua to login submit nahi karega. "
+            "Credentials save nahi honge. /cancel se flow rok sakte ho."
+        )
+    except Exception as e:
+        ig_login_sessions.pop(chat_id, None)
+        await update.message.reply_text(f"❌ Instagram page open nahi hua: {e}")
+
+
+async def _handle_ig_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consume the next private-chat username/password without logging or persisting secrets."""
+    if not update.message or not update.message.text or not update.effective_chat:
+        return False
+    chat_id = update.effective_chat.id
+    session = ig_login_sessions.get(chat_id)
+    if not session:
+        return False
+    if update.effective_chat.type != "private":
+        ig_login_sessions.pop(chat_id, None)
+        return True
+
+    if session.get("step") == "username":
+        username = update.message.text.strip()
+        if not username:
+            await update.message.reply_text("Username khali hai. Dobara username bhejo, ya /cancel.")
+            return True
+        session["username"] = username
+        session["step"] = "password"
+        await update.message.reply_text("Ab password bhejo. Password message ko main turant delete karne ki koshish karunga.")
+        return True
+
+    # Keep the password only in this local variable; don't put it in user_data,
+    # a file, a log, or a reply. Remove the session before any remote operations.
+    password = update.message.text
+    username = session.get("username", "")
+    ig_login_sessions.pop(chat_id, None)
+    try:
+        await update.message.delete()
+    except Exception:
+        password = ""
+        await update.message.reply_text(
+            "🔒 Telegram se password message delete nahi kar paya, isliye maine login submit nahi kiya. "
+            "Chat se message khud delete karo; phir /iglogin dobara chalao."
+        )
+        return True
+
+    try:
+        mgr = get_mgr()
+        if not mgr.is_connected:
+            password = ""
+            await update.effective_chat.send_message("❌ RDP disconnected hai. /connect karke /iglogin dobara chalao.")
+            return True
+        width, height = mgr.client.width, mgr.client.height
+        # Instagram's current desktop layout places the login card on the
+        # right half of the page (username around x=.75w/y=.35h); tab to
+        # password, then physically click Log in rather than relying on Enter.
+        await mgr.execute([
+            ("click", int(width * 0.75), int(height * 0.35), 1, False),
+            ("wait", 0.3), ("key", "ctrl+a"), ("text", username),
+            ("key", "tab"), ("text", password), ("wait", 0.4),
+            ("click", int(width * 0.75), int(height * 0.54), 1, False),
+            ("wait", 5.0),
+        ])
+        password = ""
+        await update.effective_chat.send_message(
+            "✅ Login details submit kar diye. Ab /screen bhejo; agar Instagram OTP/approval maange, woh RDP screen par complete karo."
+        )
+    except Exception:
+        password = ""
+        log.exception("Instagram login automation failed")
+        await update.effective_chat.send_message("❌ Login form fill nahi ho paya. /screen bhejo aur page check karo; secret save nahi hua.")
+    return True
+
+
+@guarded
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
+        return
+    if await _handle_ig_login_message(update, context):
         return
     text = update.message.text.strip()
 
@@ -1629,6 +1728,7 @@ def main() -> None:
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("iglogin", cmd_iglogin))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("ui", cmd_ui))
     app.add_handler(CommandHandler("keyboard", cmd_ui))
