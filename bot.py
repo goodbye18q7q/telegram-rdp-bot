@@ -69,7 +69,8 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /screen                       — photo of the active desktop
 
 ⌨️ Commands (they act on the ACTIVE profile):
-/win chrome — open Run (Win+R), clear any old text, search an app or name
+/win chrome — Start menu search (auto fallback to Win+R on RemoteApp servers like 103.76.214.2)
+/run calc — direct Win+R -> type app (fastest on RemoteApp: calc, notepad, mspaint, TallyPrime)
 /ctrl hello — Ctrl+A then type text into the focused app
 /edge                         — open Microsoft Edge
 /open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
@@ -582,6 +583,12 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
     env = os.environ.copy()
     env["DISPLAY"] = ":99"
     proc = None
+    # clean stale FreeRDP instances (consecutive /win calls)
+    try:
+        subprocess.run(["pkill", "-x", "xfreerdp3"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.2)
+    except Exception:
+        pass
     try:
         # start FreeRDP with RDP security (Win+R works there)
         proc = subprocess.Popen(
@@ -636,9 +643,46 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
         subprocess.run(["xdotool", "type", word], env=env, timeout=5)
         await asyncio.sleep(0.8)
         subprocess.run(["xdotool", "key", "Return"], env=env, timeout=5)
-        await asyncio.sleep(3.0)
-        # Do not press Escape here — leave the launched window / error dialog visible for verification
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(3.5)
+        # Capture inside FreeRDP before closing — this is the reliable check
+        # (simple-rdp reconnect loses the window, inside import keeps it)
+        r_after = 0.0
+        r_after_10 = 0.0
+        try:
+            from PIL import Image, ImageChops, ImageOps
+            fb_after = None
+            for imp_try in range(3):
+                try:
+                    subprocess.run(["import", "-window", wid, "/tmp/_fb_after.png"], env=env, timeout=5)
+                    if os.path.getsize("/tmp/_fb_after.png") > 5000:
+                        fb_after = Image.open("/tmp/_fb_after.png")
+                        break
+                except Exception as ie:
+                    log.warning("import try %d fail: %s", imp_try+1, ie)
+                    await asyncio.sleep(0.8)
+            if fb_after is not None:
+                # desktop is 1366x768, fb_after also 1366x768 (FreeRDP window)
+                a = ImageOps.grayscale(desktop)
+                b = ImageOps.grayscale(fb_after)
+                if a.size != b.size:
+                    b = b.resize(a.size)
+                hist = ImageChops.difference(a, b).histogram()
+                total = a.size[0] * a.size[1]
+                r_after = sum(hist[40:]) / total if total else 0
+                r_after_10 = sum(hist[10:]) / total if total else 0
+                log.info("freerdp fallback %r -> inside %.3f (thr10 %.3f), brightness %.0f", word, r_after, r_after_10, mean_brightness(fb_after))
+            else:
+                log.warning("freerdp fallback import all tries failed")
+        except Exception as e:
+            log.warning("freerdp fallback import compare fail: %s", e)
+        # Try to close the opened app / error dialog to leave desktop clean
+        try:
+            subprocess.run(["xdotool", "key", "Alt+F4"], env=env, timeout=5)
+            await asyncio.sleep(0.8)
+            subprocess.run(["xdotool", "key", "Escape"], env=env, timeout=5)
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
     except Exception as e:
         log.warning("FreeRDP fallback error: %s", e)
         return None
@@ -651,39 +695,31 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             except Exception:
                 pass
             await asyncio.sleep(1.5)
-    # reconnect simple-rdp and check result
+    # reconnect simple-rdp
     try:
         await mgr.connect()
         await asyncio.sleep(1.0)
-        closed = await mgr.screenshot()
-        r_after = diff_ratio(desktop, closed)
-        # also check with lower threshold (more sensitive for small windows like calc)
-        from PIL import ImageChops, ImageOps
-        import PIL.Image
-        # thr10 check
-        a = ImageOps.grayscale(desktop)
-        b = ImageOps.grayscale(closed)
-        if a.size != b.size:
-            b = b.resize(a.size)
-        hist = ImageChops.difference(a, b).histogram()
-        r_after_10 = sum(hist[10:]) / (a.size[0] * a.size[1]) if a.size[0]*a.size[1] else 0
-        log.info("freerdp fallback %r -> after %.3f (thr10 %.3f), brightness %.0f", word, r_after, r_after_10, mean_brightness(closed))
-        # Known apps (calc, notepad, chrome...) ko hamesha Opened maano — diff chhota bhi ho to window khula hai
-        known = {"calc","calculator","notepad","mspaint","paint","chrome","msedge","edge","brave","firefox","explorer","cmd","powershell","code","vscode","word","excel","vlc","taskmgr"}
-        if word.lower().strip() in known:
-            # diff chhota bhi ho to bhi opened — /screen se verify kar sakte hain
-            if r_after < 0.005 and r_after_10 < 0.02:
-                log.info("known app %r diff small but treating as Opened", word)
-            return f"Opened: {word}"
-        if r_after < 0.005 and r_after_10 < 0.02:
-            return f"Not found: {word}"
-        # For unknown apps, diff bada hai to opened, chhota to not found — but fallback me diff hamesha bada aata hai (error dialog bhi), isliye unknown ke liye conservative
-        if r_after < 0.01:
-            return f"Not found: {word}"
-        return f"Opened: {word}"
     except Exception as e:
         log.warning("freerdp fallback reconnect fail: %s", e)
-        return None
+        # Even if reconnect fails, we already have inside diff
+        pass
+    # Decide based on inside diff — calc 0.07, notepad 0.5 = Opened; zzz 0.005, chrome-not-installed 0.0006 = Not found
+    # Whitelist for known apps with lenient thr10 check
+    known = {"calc","calculator","notepad","mspaint","paint","chrome","msedge","edge","brave","firefox","explorer","cmd","powershell","code","vscode","word","excel","vlc","taskmgr","tallyprime","tally"}
+    low = word.lower().strip()
+    # Use inside diff: thr40 >0.02 or thr10 >0.03 = Opened
+    is_open = r_after > 0.02 or r_after_10 > 0.03
+    # For calibration: calc 0.070/0.075, notepad 0.503/0.506 => open; zzz 0.005/0.006, chrome 0.0006/0.0009 => not open
+    if low in known and is_open:
+        return f"Opened: {word}"
+    if is_open:
+        # Unknown app but visible change -> treat as Opened (could be error dialog? but error dialog on this RemoteApp server is invisible — experiment showed zzz no dialog, so safe)
+        # To be safe, require larger diff for unknown: >0.05
+        if r_after > 0.05 or r_after_10 > 0.06:
+            return f"Opened: {word}"
+        # small diff for unknown -> Not found
+        return f"Not found: {word}"
+    return f"Not found: {word}" if not is_open else f"Opened: {word}"
 
 
 async def _win_flow(update: Update, word: str) -> None:
@@ -721,13 +757,22 @@ async def _win_flow(update: Update, word: str) -> None:
         closed = await mgr.screenshot()
 
         r_after = diff_ratio(desktop, closed)
+        # also thr10 for small windows like calc (0.033 thr40 but thr10 0.05+)
+        from PIL import ImageChops, ImageOps
+        a10 = ImageOps.grayscale(desktop)
+        b10 = ImageOps.grayscale(closed)
+        if a10.size != b10.size:
+            b10 = b10.resize(a10.size)
+        hist10 = ImageChops.difference(a10, b10).histogram()
+        r_after_10 = sum(hist10[10:]) / (a10.size[0]*a10.size[1]) if a10.size[0]*a10.size[1] else 0
         # Menu abhi bhi khula hua hai = Enter ne kuch nahi kiya.
         menu_open = diff_ratio(dialog, closed) < 0.05
         log.info(
-            "win %r -> dialog %.3f, after %.3f, menu_open %s, brightness %.0f",
+            "win %r -> dialog %.3f, after %.3f (thr10 %.3f), menu_open %s, brightness %.0f",
             word,
             r_dialog,
             r_after,
+            r_after_10,
             menu_open,
             mean_brightness(closed),
         )
@@ -745,10 +790,19 @@ async def _win_flow(update: Update, word: str) -> None:
                 f"FreeRDP fallback bhi available nahi hai."
             )
             return
-        if menu_open or r_after < OPENED_RATIO:
-            await update.message.reply_text(f"Not found: {word}")
-        else:
+        # Check if Start menu path says Opened: not menu_open and diff big enough
+        # Use lenient threshold for small windows: thr10 >0.04 counts as opened
+        is_opened_start = (not menu_open) and (r_after >= OPENED_RATIO or r_after_10 >= 0.04)
+        if is_opened_start:
             await update.message.reply_text(f"Opened: {word}")
+            return
+        # Normal path says Not found — but on RemoteApp servers Start menu is flaky, try Run fallback as second chance
+        log.info("win %r: Not found via Start menu (after %.3f thr10 %.3f), trying Run fallback", word, r_after, r_after_10)
+        fb = await _win_via_freerdp(mgr, word)
+        if fb is not None:
+            await update.message.reply_text(fb + " (via Run dialog)")
+            return
+        await update.message.reply_text(f"Not found: {word}")
     except Exception as e:
         log.exception("win search failed")
         await update.message.reply_text(f"Error: {e}")
@@ -757,6 +811,27 @@ async def _win_flow(update: Update, word: str) -> None:
 @guarded
 async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _win_flow(update, " ".join(context.args or []).strip())
+
+
+@guarded
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Direct Win+R -> type -> Enter (RemoteApp servers ke liye). /run calc, /run notepad"""
+    word = " ".join(context.args or []).strip()
+    if not word:
+        await update.message.reply_text("Usage: /run <app>  (e.g. /run calc, /run notepad, /run mspaint)")
+        return
+    try:
+        mgr = get_mgr()
+        # This server (103.76.214.2) is RemoteApp — Start menu blocked, direct Run is fastest
+        log.info("cmd_run %r via FreeRDP", word)
+        fb = await _win_via_freerdp(mgr, word)
+        if fb is not None:
+            await update.message.reply_text(fb + " (via Run dialog)")
+        else:
+            await update.message.reply_text("❌ Run fallback available nahi hai (xvfb/xfreerdp missing). /win try karo.")
+    except Exception as e:
+        log.exception("run failed")
+        await update.message.reply_text(f"Error: {e}")
 
 
 @guarded
@@ -815,6 +890,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return await cmd_list(update, context)
     if low == "win" or low.startswith("win "):
         return await _win_flow(update, text[3:].strip())
+    if low == "run" or low.startswith("run "):
+        context.args = text[3:].strip().split() if text[3:].strip() else []
+        return await cmd_run(update, context)
     if low == "ctrl" or low.startswith("ctrl "):
         return await _ctrl_flow(update, text[4:].strip())
 
@@ -864,6 +942,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("win", cmd_win))
+    app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("ctrl", cmd_ctrl))
     app.add_handler(MessageHandler(filters.TEXT, on_message))
 
