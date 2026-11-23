@@ -915,12 +915,39 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
     xv = shutil.which("Xvfb")
     if freerdp is None or xd is None or imp is None:
         log.warning("FreeRDP fallback missing: freerdp=%s xdotool=%s import=%s Xvfb=%s PATH=%s", freerdp, xd, imp, xv, os.environ.get("PATH"))
-        # also try to list /usr/bin/*freerdp* for debugging
         try:
             import glob
             freerdps = glob.glob("/usr/bin/*freerdp*")
             log.warning("glob /usr/bin/*freerdp*: %s", freerdps)
         except: pass
+        # Fallback without FreeRDP: try simple-rdp Run via Start menu search for 'Run' app
+        # This works on tally even when Win+R blocked, because we use ctrl+esc -> type 'Run'
+        try:
+            log.info("Trying simple-rdp Run fallback for %r", word)
+            # Take base screenshot
+            base = desktop
+            # Open Start -> type Run -> Enter (opens Run dialog)
+            await mgr.execute([("key", "ctrl+esc"), ("wait", 0.8)])
+            await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+            await mgr.execute([("text", "Run"), ("wait", 0.5), ("key", "enter"), ("wait", 1.5)])
+            # Now Run dialog should be open -> type app and enter
+            await mgr.execute([("key", "ctrl+a"), ("wait", 0.2), ("key", "backspace"), ("wait", 0.2)])
+            await mgr.execute([("text", word), ("wait", 0.5), ("key", "enter"), ("wait", 2.5)])
+            # Screenshot after
+            after_img = await mgr.screenshot()
+            r = diff_ratio(base, after_img)
+            from PIL import ImageChops, ImageOps
+            a = ImageOps.grayscale(base); b = ImageOps.grayscale(after_img)
+            if a.size != b.size: b = b.resize(a.size)
+            hist = ImageChops.difference(a,b).histogram()
+            r10 = sum(hist[10:])/(a.size[0]*a.size[1]) if a.size[0]*a.size[1] else 0
+            log.info("simple Run fallback %r -> diff %.3f thr10 %.3f", word, r, r10)
+            if r > 0.02 or r10 > 0.03:
+                return f"Opened: {word}"
+            else:
+                return f"Not found: {word}"
+        except Exception as e:
+            log.warning("simple Run fallback failed: %s", e)
         return None
     if not await _ensure_xvfb():
         return None
