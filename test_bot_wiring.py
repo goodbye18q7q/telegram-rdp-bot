@@ -268,38 +268,66 @@ class TestInstagramGuidedFlow(BotTestCase):
 
 
 class TestWebNavigation(BotTestCase):
+    def test_focus_does_not_click_active_taskbar_button(self):
+        from PIL import Image, ImageDraw
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        browser = Image.new("RGB", (1366, 768), "white")
+        ImageDraw.Draw(browser).rectangle((100, 42, 220, 55), fill=(35, 35, 35))
+        fake.screenshot_nowait = AsyncMock(return_value=browser)
+        focused = asyncio.run(bot._focus_edge_window(fake))
+        self.assertTrue(focused)
+        actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
+        self.assertFalse(any(a[0] == "click" for a in actions))
+        self.assertIn(("key", "alt+space"), actions)
+        self.assertIn(("key", "x"), actions)
+
     def test_full_windows_rdp_launches_edge_then_uses_address_bar(self):
         from types import SimpleNamespace
         fake = self.use_fake()
         fake.client = SimpleNamespace(width=1366, height=768)
         old = bot._focus_edge_window
+        old_looks = bot._looks_like_edge_window
         focus = AsyncMock(return_value=True)
         bot._focus_edge_window = focus
+        bot._looks_like_edge_window = lambda image: True
+        fake.screenshot_nowait = AsyncMock(return_value=None)
         try:
             result = asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "windows-rdp"))
         finally:
             bot._focus_edge_window = old
+            bot._looks_like_edge_window = old_looks
         focus.assert_awaited_once_with(fake)
         actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
         self.assertIn(("click", 409, 61, 1, False), actions)
         self.assertIn(("key", "escape"), actions)
         self.assertEqual([a[1] for a in actions if a[0] == "text"], list("https://www.instagram.com"))
-        self.assertIn("Navigated", result)
+        self.assertIn("Navigation sent", result)
 
-    def test_tally_remoteapp_opens_chrome_then_navigates_url(self):
+    def test_tally_remoteapp_reuses_focused_browser_then_navigates(self):
         from types import SimpleNamespace
         fake = self.use_fake()
         fake.client = SimpleNamespace(width=1366, height=768)
-        old = bot._open_browser_via_run
-        bot._open_browser_via_run = AsyncMock(return_value="Opened: chrome")
+        old_focus = bot._focus_edge_window
+        old_launch = bot._open_browser_via_run
+        old_looks = bot._looks_like_edge_window
+        bot._focus_edge_window = AsyncMock(return_value=True)
+        bot._looks_like_edge_window = lambda image: True
+        fake.screenshot_nowait = AsyncMock(return_value=None)
+        launch_mock = AsyncMock(return_value="Opened: chrome")
+        bot._open_browser_via_run = launch_mock
         try:
-            asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "103.76.214.2"))
+            result = asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "103.76.214.2"))
         finally:
-            bot._open_browser_via_run = old
-        bot._open_browser_via_run = old
+            bot._focus_edge_window = old_focus
+            bot._open_browser_via_run = old_launch
+            bot._looks_like_edge_window = old_looks
+        launch_mock.assert_not_awaited()
         calls = [a for call in fake.execute.await_args_list for a in call.args[0]]
         self.assertIn(("click", 409, 61, 1, False), calls)
         self.assertEqual([a[1] for a in calls if a[0] == "text"], list("https://www.instagram.com"))
+        self.assertIn("maximized", result)
 
 
 class TestProfiles(BotTestCase):

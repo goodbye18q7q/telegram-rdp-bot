@@ -99,8 +99,9 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /search wallpaper 4k — search + numbered list (1,2,3...) → reply 1 to open
 /search instagram — shows 1) insta 2) etc → tap 1 to open in RDP Chrome
 /goto instagram.com — open a URL directly
-/instagram — launch Edge and open Instagram; then tap Start login or Open Messages.
+/instagram — restore/maximize the existing browser and open Instagram; then choose login or Messages.
 /igdm — show the Open Messages button (use when Instagram is loaded and signed in).
+Instagram messaging: Open Messages → /fetchgc → select chats → /done; review/confirm before any workflow run.
 /fetchgc — show up to five recent Instagram inbox chats for selection.
 /done — finalize chosen groups and prepare one browser tab per group.
 /workflow — show the first five saved Automa workflows to select.
@@ -321,27 +322,49 @@ BROWSER_CANDIDATES = [
 
 
 def _looks_like_edge_window(image) -> bool:
-    """Check for Edge's neutral tab/address-bar text, not just a bright page."""
+    """Check for browser tab/address-bar chrome, not just a bright page."""
     width, height = image.size
     band = image.convert("RGB").crop((int(width*.06), int(height*.04),
                                       int(width*.80), int(height*.12)))
     pixels = list(band.get_flattened_data())
     if not pixels:
         return False
-    # Automa's dashboard is mostly white too; Edge's URL/tab chrome has dark,
-    # low-saturation text/icons in this strip, unlike the dashboard canvas.
+    # Chrome and Edge both expose dark, low-saturation text/icons here. The
+    # Automa dashboard canvas is mostly white and is not sufficient evidence.
     chrome_ink = sum(max(rgb) < 175 and max(rgb)-min(rgb) < 45 for rgb in pixels)
     return chrome_ink / len(pixels) > 0.012
 
 
+async def _maximize_foreground_window(mgr) -> None:
+    """Restore/maximize the foreground app using Windows' system menu."""
+    await mgr.execute([("key", "alt+space"), ("wait", 0.4), ("key", "x"),
+                       ("wait", 0.8), ("key", "escape"), ("wait", 0.2)])
+
+
 async def _focus_edge_window(mgr) -> bool:
-    """Restore Edge from the taskbar and positively verify its chrome is visible."""
+    """Focus/restore a browser without toggling an already-active taskbar window.
+
+    First inspect the current screen: clicking an active taskbar button minimizes
+    its window, which caused the old helper to intermittently leave Edge hidden.
+    If it is not already foregrounded, try Alt+Tab before the pinned taskbar
+    slot (which may toggle/minimize if it is already selected). Every path is
+    screenshot-verified.
+    """
     width, height = mgr.client.width, mgr.client.height
+    initial = await mgr.screenshot_nowait()
+    if _looks_like_edge_window(initial):
+        await _maximize_foreground_window(mgr)
+        return _looks_like_edge_window(await mgr.screenshot_nowait())
+
     x, y = int(width * 0.341), int(height * 0.974)
-    for _ in range(2):
-        await mgr.execute([("click", x, y, 1, False), ("wait", 1.2)])
-        image = await mgr.screenshot_nowait()
-        if _looks_like_edge_window(image):
+    for actions in (
+        [("key", "alt+tab"), ("wait", 0.7)],
+        [("key", "alt+tab"), ("wait", 0.7)],
+        [("click", x, y, 1, False), ("wait", 1.0)],
+    ):
+        await mgr.execute(actions)
+        await _maximize_foreground_window(mgr)
+        if _looks_like_edge_window(await mgr.screenshot_nowait()):
             return True
     return False
 
@@ -363,24 +386,35 @@ async def _navigate_browser_addressbar(mgr, url: str) -> None:
 
 
 async def _open_url_for_profile(mgr, url: str, host: str | None = None) -> str | None:
-    """Open a URL on either Tally RemoteApp or a regular Windows RDP desktop."""
+    """Open a URL in the existing browser profile, restoring/maximizing first."""
     host = host or current.get("host", "")
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
-    if _is_remoteapp(mgr, host):
-        # Launch the installed browser first, then navigate via its address bar.
-        # Passing a URL inside the Run command is lossy on RemoteApp shells.
-        opened = await _open_browser_via_run(mgr, None)
-    else:
-        # Prefer the pinned Edge taskbar icon on ordinary Windows desktops. The
-        # generic Win+R launcher can type into Explorer when its dialog is swallowed.
-        focused = await _focus_edge_window(mgr)
-        opened = "Opened: msedge" if focused else "Not found: msedge"
-    if not opened or "Not found" in opened:
-        return opened
-    await asyncio.sleep(2.0)
+
+    # Reuse the already-open browser first so its existing login/profile is kept.
+    # Do not launch another browser window unless focus/restore could not be verified.
+    focused = await _focus_edge_window(mgr)
+    if not focused:
+        if _is_remoteapp(mgr, host):
+            opened = await _open_browser_via_run(mgr, None)  # Chrome is installed on RemoteApp.
+        else:
+            opened = await _win_via_freerdp(mgr, "msedge")
+            if not opened or "Not found" in opened:
+                opened = await _open_browser_via_run(mgr, None)
+        if not opened or "Not found" in opened:
+            return opened or "Not found: browser"
+        await asyncio.sleep(2.0)
+        await _maximize_foreground_window(mgr)
+        if not _looks_like_edge_window(await mgr.screenshot_nowait()):
+            return "Browser launch reported, but foreground browser could not be verified"
+
+    # _focus_edge_window already restored, maximized, and verified the foreground
+    # browser. Verify browser chrome remains on-screen after navigation; this is
+    # not OCR/DOM verification of Instagram content or the account's login state.
     await _navigate_browser_addressbar(mgr, url)
-    return f"Navigated the current browser to {url}"
+    if not _looks_like_edge_window(await mgr.screenshot_nowait()):
+        raise RuntimeError("Navigation was sent, but browser chrome was not visible afterward; check /screen")
+    return f"Navigation sent to {url}; maximized browser remained visible"
 
 
 async def _open_browser_via_run(mgr, url: str | None = None) -> str | None:
@@ -1629,8 +1663,9 @@ async def cmd_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
         await update.message.reply_text(
-            "✅ Edge kholkar Instagram open kiya (Tally RemoteApp par Chrome use hoga). "
-            "Login chahiye to Start login dabao; agar pehle se logged in ho to Open Messages dabao.",
+            "✅ Instagram maximized browser mein open kiya (RemoteApp par Chrome, otherwise Edge). "
+            "Agar browser profile mein pehle se login hai to Open Messages dabao; warna Start login. "
+            "Existing browser profile hi reuse kiya hai—desktop login ko main independently verify nahi kar sakta.",
             reply_markup=_instagram_after_open_keyboard(),
         )
     except Exception as e:
@@ -1657,7 +1692,9 @@ async def on_igflow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if action == "open":
             res = await _open_url_for_profile(mgr, "https://www.instagram.com/", current.get("host", ""))
             await query.message.reply_text(
-                f"✅ Instagram opened. Agar signed out ho to Start login dabao; agar already logged in ho to Open Messages.\n{res or ''}",
+                "✅ Instagram maximized browser mein khola. Agar browser profile pehle se signed in hai to Open Messages dabao; warna Start login.\n"
+                "Messages se chat list kholne ke baad /fetchgc → groups select → /done se tabs prepare karo. Workflow chalana ho tabhi /start use karo; pehle prompts/confirmation review karo. Koi DM apne aap send nahi hota.\n"
+                f"{res or ''}",
                 reply_markup=_instagram_after_open_keyboard(),
             )
         elif action == "login":
@@ -1672,7 +1709,11 @@ async def on_igflow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif action == "messages":
             await _click_instagram_messages(mgr)
             ig_login_sessions.pop(chat_id, None)
-            await query.message.reply_text("✅ Messages icon click kiya. Koi DM send nahi hua; /screen se verify karo.")
+            await query.message.reply_text(
+                "✅ Instagram Messages khola. Koi DM send nahi hua.\n"
+                "Next: /fetchgc se recent chats dikhao → desired chats select karo → /done se tabs prepare karo. "
+                "Workflow choose/import karne ke baad hi /start chalao; /screen se verify karo."
+            )
         else:
             await query.message.reply_text("Unknown Instagram action.")
     except Exception as e:
