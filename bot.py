@@ -1522,10 +1522,10 @@ async def on_igdm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         mgr = get_mgr()
         await mgr.ensure()
         width, height = mgr.client.width, mgr.client.height
-        # Instagram desktop left rail: Direct Messages/paper-plane icon is
-        # immediately above Search. Coordinates scale with the RDP resolution.
+        # Current desktop layout: the Direct Messages paper-plane icon is at
+        # x≈40,y≈307. The old y=339 coordinate hit Search instead.
         await mgr.execute([
-            ("click", int(width * 35 / 1366), int(height * 339 / 768), 1, False),
+            ("click", int(width * 40 / 1366), int(height * 307 / 768), 1, False),
             ("wait", 2.0),
         ])
         await query.message.reply_text(

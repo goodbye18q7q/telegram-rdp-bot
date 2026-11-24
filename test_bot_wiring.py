@@ -160,7 +160,7 @@ class TestInstagramDmButton(BotTestCase):
         asyncio.run(bot.on_igdm_callback(update, MagicMock()))
 
         actions = fake.execute.await_args[0][0]
-        self.assertIn(("click", 35, 339, 1, False), actions)
+        self.assertIn(("click", 40, 307, 1, False), actions)
         self.assertIn("koi DM send nahi hua", query.message.reply_text.await_args.args[0])
 
 
