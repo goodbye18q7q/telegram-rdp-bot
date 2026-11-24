@@ -167,6 +167,8 @@ class TestAutomaFeatureControls(unittest.TestCase):
     def test_dashboard_detector_rejects_blank_white_page(self):
         self.assertFalse(automa_features._automa_dashboard_visible(Image.new("RGB", (1366,768), "white")))
         self.assertTrue(automa_features._automa_dashboard_visible(self.dashboard_image()))
+        from bot import _looks_like_edge_window
+        self.assertFalse(_looks_like_edge_window(self.dashboard_image()))
 
     def test_automa_popup_failure_stops_before_dashboard_page_click(self):
         mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
@@ -182,6 +184,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         from bot import _focus_edge_window
         dark = Image.new("RGB", (1366, 768), (20, 80, 130))
         edge = Image.new("RGB", (1366, 768), "white")
+        ImageDraw.Draw(edge).rectangle((110,55,910,67), fill="black")
         mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768),
                               execute=AsyncMock(), screenshot_nowait=AsyncMock(side_effect=[dark, edge]))
         self.assertTrue(asyncio.run(_focus_edge_window(mgr)))

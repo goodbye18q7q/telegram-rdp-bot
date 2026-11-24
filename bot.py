@@ -321,14 +321,17 @@ BROWSER_CANDIDATES = [
 
 
 def _looks_like_edge_window(image) -> bool:
-    """Cheap positive check that Edge's tab/address-bar chrome is visible."""
-    gray = ImageOps.grayscale(image.crop((0, 0, image.width, min(100, image.height))))
-    hist = gray.histogram()
-    total = sum(hist)
-    if not total:
+    """Check for Edge's neutral tab/address-bar text, not just a bright page."""
+    width, height = image.size
+    band = image.convert("RGB").crop((int(width*.06), int(height*.04),
+                                      int(width*.80), int(height*.12)))
+    pixels = list(band.get_flattened_data())
+    if not pixels:
         return False
-    bright = sum(hist[185:]) / total
-    return bright > 0.35
+    # Automa's dashboard is mostly white too; Edge's URL/tab chrome has dark,
+    # low-saturation text/icons in this strip, unlike the dashboard canvas.
+    chrome_ink = sum(max(rgb) < 175 and max(rgb)-min(rgb) < 45 for rgb in pixels)
+    return chrome_ink / len(pixels) > 0.012
 
 
 async def _focus_edge_window(mgr) -> bool:
