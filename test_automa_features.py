@@ -31,6 +31,17 @@ class TestAutomaFeatureControls(unittest.TestCase):
             draw.ellipse((118, y, 162, y+47), fill=(190, 85 + i*20, 120))
         return image
 
+    @staticmethod
+    def popup_image(row_y: int = 335, control: str = "play") -> Image.Image:
+        image = Image.new("RGB", (1366, 768), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((772, 84, 1122, 277), fill=(20, 20, 20))
+        if control == "play":
+            draw.line([(1040,row_y-6),(1049,row_y),(1040,row_y+6),(1040,row_y-6)], fill="black", width=2)
+        elif control == "stop":
+            draw.rectangle((1041,row_y-3,1047,row_y+3), fill="black")
+        return image
+
     def setUp(self):
         self.bot = SimpleNamespace(_focus_edge_window=AsyncMock(return_value=True))
         self.chat_id = 99
@@ -40,8 +51,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         automa_features.flows.pop(self.chat_id, None)
 
     def test_start_runs_without_extra_prompt_once_per_tab(self):
-        play_img = Image.new("RGB", (1366, 768), "white")
-        ImageDraw.Draw(play_img).line([(756,329),(765,335),(756,341),(756,329)], fill="black", width=2)
+        play_img = self.popup_image()
         flow = ChatFlow(confirmed=True, selected={1}, workflow_digest="digest",
                         workflow_name="Safe test", active_tabs=[0, 1], send_clicks=1)
         automa_features.flows[self.chat_id] = flow
@@ -56,12 +66,11 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertEqual(flow.run_state, "running")
         self.assertEqual(flow.run_completed, 2)
         self.assertEqual(flow.completed_targets, set(automa_features._target_keys(flow)))
-        self.assertEqual(mgr.screenshot.await_count, 2)
+        self.assertEqual(mgr.screenshot.await_count, 4)
 
     def test_start_runs_selected_saved_workflow_row(self):
         index, row_y = 2, 335 + 80*2
-        play_img = Image.new("RGB", (1366, 768), "white")
-        ImageDraw.Draw(play_img).line([(756,row_y-6),(765,row_y),(756,row_y+6),(756,row_y-6)], fill="black", width=2)
+        play_img = self.popup_image(row_y)
         flow = ChatFlow(confirmed=True, selected={1}, saved_workflow_index=index, active_tabs=[0])
         automa_features.flows[self.chat_id] = flow
         mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
@@ -72,7 +81,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         update, message = update_for_message(self.chat_id)
         asyncio.run(automa_features.cmd_start(update, MagicMock(), self.bot))
         clicks = [a for call in mgr.execute.await_args_list for a in call.args[0] if a[0] == "click"]
-        self.assertIn(("click", 760, row_y, 1, False), clicks)
+        self.assertIn(("click", 1044, row_y, 1, False), clicks)
         self.assertIn("Saved workflow 3", message.reply_text.await_args.args[0])
 
     def test_start_requires_selected_groups_and_prepared_tabs(self):
@@ -82,8 +91,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertIn("/fetchgc", message.reply_text.await_args.args[0])
 
     def test_repeat_start_is_not_blocked_by_previous_run_state(self):
-        play_img = Image.new("RGB", (1366, 768), "white")
-        ImageDraw.Draw(play_img).line([(756,329),(765,335),(756,341),(756,329)], fill="black", width=2)
+        play_img = self.popup_image()
         flow = ChatFlow(confirmed=True, selected={1}, workflow_digest="digest",
                         workflow_name="Repeatable workflow", active_tabs=[0], run_state="running")
         automa_features.flows[self.chat_id] = flow
@@ -97,7 +105,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertEqual(flow.run_completed, 1)
 
     def test_workflow_command_shows_screenshot_and_five_choices(self):
-        image = Image.new("RGB", (1366, 768), "white")
+        image = self.popup_image()
         mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
                               execute=AsyncMock(), screenshot=AsyncMock(return_value=image))
         bot = SimpleNamespace(get_mgr=lambda: mgr, _focus_edge_window=AsyncMock(return_value=True),
@@ -133,9 +141,9 @@ class TestAutomaFeatureControls(unittest.TestCase):
 
     def test_run_button_classifier_distinguishes_play_and_stop(self):
         play_img = Image.new("RGB", (1366, 768), "white")
-        ImageDraw.Draw(play_img).line([(756,329),(765,335),(756,341),(756,329)], fill="black", width=2)
+        ImageDraw.Draw(play_img).line([(1040,329),(1049,335),(1040,341),(1040,329)], fill="black", width=2)
         stop_img = Image.new("RGB", (1366, 768), "white")
-        ImageDraw.Draw(stop_img).rectangle((757,332,763,338), fill="black")
+        ImageDraw.Draw(stop_img).rectangle((1041,332,1047,338), fill="black")
         self.assertEqual(automa_features._classify_run_control(play_img), "play")
         self.assertEqual(automa_features._classify_run_control(stop_img), "stop")
 

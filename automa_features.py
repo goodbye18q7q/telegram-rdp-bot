@@ -70,7 +70,7 @@ def _target_keys(flow: ChatFlow) -> list[str]:
 def _classify_run_control(image: Image.Image, row_center_y: int = 335) -> str:
     """Distinguish the selected Automa row's Play triangle from its Stop square."""
     sx, sy = image.width / 1366.0, image.height / 768.0
-    cx, cy = int(760*sx), int(row_center_y*sy)
+    cx, cy = int((1366-322)*sx), int(row_center_y*sy)
     crop = image.convert("RGB").crop((cx-int(9*sx), cy-int(10*sy), cx+int(9*sx), cy+int(10*sy)))
     w, h = crop.size
     points = [(i % w, i // w) for i, (r, g, b) in enumerate(crop.get_flattened_data()) if max(r, g, b) < 100]
@@ -88,20 +88,47 @@ def _classify_run_control(image: Image.Image, row_center_y: int = 335) -> str:
     return "unknown"
 
 
+def _automa_popup_visible(image: Image.Image) -> bool:
+    sx, sy = image.width / 1366.0, image.height / 768.0
+    box = (int(772*sx), int(84*sy), int(1123*sx), int(277*sy))
+    crop = image.convert("RGB").crop(box)
+    pixels = list(crop.get_flattened_data())
+    return bool(pixels) and sum(max(rgb) < 80 for rgb in pixels) / len(pixels) > 0.55
+
+
+def _automa_dashboard_visible(image: Image.Image) -> bool:
+    sx, sy = image.width / 1366.0, image.height / 768.0
+    box = (int(100*sx), int(90*sy), int(1300*sx), int(700*sy))
+    pixels = list(image.convert("RGB").crop(box).get_flattened_data())
+    return bool(pixels) and sum(min(rgb) > 230 for rgb in pixels) / len(pixels) > 0.82
+
+
+async def _maximize_edge(mgr) -> None:
+    """Normalize Edge to full screen before using browser-toolbar coordinates."""
+    await mgr.execute([("key", "alt+space"), ("wait", 0.5), ("key", "x"),
+                       ("wait", 0.8), ("key", "escape"), ("wait", 0.3)])
+
+
 async def _open_automa_popup(bot, mgr) -> None:
-    """Open the Automa extension popup without navigating away from the page."""
+    """Open and positively verify the Automa popup on maximized Edge."""
     await mgr.ensure()
     if not await bot._focus_edge_window(mgr):
         raise RuntimeError("Edge window could not be focused; refusing Automa clicks")
-    x, y = _scale(mgr, 838, 67)
+    await _maximize_edge(mgr)
+    x, y = _scale(mgr, 1366-244, 67)
     await mgr.execute([("click", x, y, 1, False), ("wait", 1.0)])
+    if not _automa_popup_visible(await mgr.screenshot()):
+        await mgr.execute([("key", "escape")])
+        raise RuntimeError("Automa popup was not detected; stopped before clicking the page")
 
 
 async def _open_automa_dashboard(bot, mgr) -> None:
-    """Open Automa through the pinned Edge extension icon, then Dashboard."""
+    """Open Automa Dashboard only after confirming its extension popup."""
     await _open_automa_popup(bot, mgr)
-    hx, hy = _scale(mgr, 798, 136)
+    hx, hy = _scale(mgr, 1366-284, 136)
     await mgr.execute([("click", hx, hy, 1, False), ("wait", 3.0)])
+    if not _automa_dashboard_visible(await mgr.screenshot()):
+        raise RuntimeError("Automa dashboard was not detected; refusing further page clicks")
 
 
 async def cmd_fetchgc(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -251,7 +278,7 @@ async def _open_selected_workflow_popup(flow: ChatFlow, bot, mgr) -> tuple[Image
     else:
         if not flow.workflow_name:
             raise RuntimeError("No workflow selected")
-        sx, sy = _scale(mgr, 650, 192)
+        sx, sy = _scale(mgr, 1366-432, 192)
         await mgr.execute([("click", sx, sy, 1, False), ("key", "ctrl+a"),
                            ("text", flow.workflow_name), ("wait", 0.8)])
         row_y = 335
@@ -269,7 +296,7 @@ async def _run_flow_once_per_tab(flow: ChatFlow, bot) -> int:
         image, row_y = await _open_selected_workflow_popup(flow, bot, mgr)
         if _classify_run_control(image, row_y) != "play":
             raise RuntimeError("Selected workflow Play control not detected; no click sent")
-        rx, ry = _scale(mgr, 760, row_y)
+        rx, ry = _scale(mgr, 1366-322, row_y)
         await mgr.execute([("click", rx, ry, 1, False), ("wait", 1.0)])
         flow.run_completed += 1
         if flow.run_completed < len(flow.active_tabs):
@@ -325,7 +352,7 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
                            ("click", int(mgr.client.width*0.29), int(mgr.client.height*0.09), 1, False),
                            ("key", "ctrl+l"), ("text", f"{base}/automa-file/{token}"), ("key", "enter"), ("wait", 6.0)])
         await _open_automa_dashboard(bot, mgr)
-        x, y = _scale(mgr, 124, 243)
+        x, y = _scale(mgr, 1080, 179)
         username = (mgr.cfg.get("rdp_user") or "testing").split("\\")[-1]
         username = re.sub(r"[^A-Za-z0-9._-]", "", username) or "testing"
         target = f"C:\\Users\\{username}\\Downloads\\{safe_name}"
@@ -371,7 +398,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
         clicked = 0
         for position, _ in enumerate(flow.active_tabs):
             image, row_y = await _open_selected_workflow_popup(flow, bot, mgr)
-            rx, ry = _scale(mgr, 760, row_y)
+            rx, ry = _scale(mgr, 1366-322, row_y)
             if _classify_run_control(image, row_y) == "stop":
                 await mgr.execute([("click", rx, ry, 1, False), ("wait", 1.0)])
                 clicked += 1
