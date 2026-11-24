@@ -89,7 +89,11 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /win chrome — Start menu search (auto fallback to Win+R on RemoteApp servers like 103.76.214.2)
 /run calc — direct Win+R -> type app (fastest on RemoteApp: calc, notepad, mspaint, TallyPrime)
 /ctrl hello — Ctrl+A then type text into the focused app
-/edge                         — open Microsoft Edge
+/edge                         — open or focus Microsoft Edge
+/minimize                     — minimize the focused RDP window
+/maximize                     — maximize the focused RDP window
+/close                        — close the focused window (not the RDP session)
+/split                        — open Edge Split Screen for the current/next tab
 /open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
 /open instagram — open a website
 /search wallpaper 4k — search + numbered list (1,2,3...) → reply 1 to open
@@ -705,11 +709,27 @@ async def _do_connect(update: Update, name: str | None = None) -> None:
         p = profiles.get(key, {})
         host = p.get("host", current["host"])
         port = p.get("port", current["port"])
+        edge_opened = None
+        # On ordinary Windows desktops, restore/launch the pinned Edge taskbar
+        # icon. Do not run an unverified shell command: that previously left
+        # Explorer in the foreground. Keep Tally RemoteApp untouched.
+        if not _is_remoteapp(mgr, host):
+            try:
+                edge_opened = await _focus_edge_window(mgr)
+            except Exception:
+                log.exception("Edge auto-focus after RDP connect failed")
         open_instagram = InlineKeyboardMarkup([[
             InlineKeyboardButton("📸 Open Instagram", callback_data="igflow:open")
         ]])
+        edge_status = (
+            "Edge focused/open kiya."
+            if edge_opened is True else
+            "Tally RemoteApp ko nahi chheda; browser button se khol sakte ho."
+            if _is_remoteapp(mgr, host) else
+            "Edge taskbar se open/focus confirm nahi hua; /screen check karo."
+        )
         await update.message.reply_text(
-            f"✅ Connected: {key} — {host}:{port}\nTallyPrime/RDP desktop wahi rahega. Instagram kholne ke liye button dabao.",
+            f"✅ Connected: {key} — {host}:{port}\n{edge_status} Instagram ke liye button dabao.",
             reply_markup=open_instagram,
         )
     except Exception as e:
@@ -1683,15 +1703,73 @@ async def cmd_ui(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         url = "https://telegram-rdp-bot.onrender.com/ui"
     await update.message.reply_text(f"🎮 Virtual Keyboard + Mouse:\n{url}\n\n• Screen pe tap = click\n• Pad drag = mouse move\n• Type box + keyboard\n• Fix Black button\n• Har RDP apne lock me — dusre ko block nahi karega")
 
+async def _window_command(update: Update, actions: list, success: str) -> None:
+    """Apply a system-level window shortcut to the focused RDP window."""
+    try:
+        mgr = get_mgr()
+        await mgr.ensure()
+        await mgr.execute(actions)
+        await update.message.reply_text(success)
+    except Exception as e:
+        log.exception("window command failed")
+        await update.message.reply_text(f"❌ Window command failed: {e}")
+
+
+@guarded
+async def cmd_minimize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # The system-menu Minimize mnemonic avoids a second Win+Down targeting a
+    # different window after the first press changes focus.
+    await _window_command(update, [("key", "alt+space"), ("key", "n")],
+                          "✅ Focused window minimized (RDP session stays connected).")
+
+
+@guarded
+async def cmd_maximize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _window_command(update, [("key", "win+up")], "✅ Focused window maximized.")
+
+
+@guarded
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _window_command(update, [("key", "alt+f4")], "✅ Close shortcut sent to the focused window (RDP session stays connected).")
+
+
+@guarded
+async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open Edge's native two-tab Split Screen without changing other windows."""
+    try:
+        mgr = get_mgr()
+        await mgr.ensure()
+        if not await _focus_edge_window(mgr):
+            await update.message.reply_text("❌ Edge focus confirm nahi hua; split shortcut nahi bheja.")
+            return
+        await mgr.execute([("key", "ctrl+shift+2"), ("wait", 1.5)])
+        image = await mgr.screenshot()
+        buf = io.BytesIO(); image.save(buf, format="PNG"); buf.seek(0)
+        await update.message.reply_photo(
+            photo=buf,
+            caption=("✅ Edge Split Screen shortcut bheja. Agar version mein horizontal/stacked layout available ho, "
+                     "split-pane menu se top-bottom select karo. Kuch Edge builds sirf side-by-side dete hain; "
+                     "ye command dusre RDP windows ko move nahi karti."),
+        )
+    except Exception as e:
+        log.exception("Edge split failed")
+        await update.message.reply_text(f"❌ Edge split open nahi hua: {e}")
+
+
 @guarded
 async def cmd_edge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open Microsoft Edge."""
+    """Launch/restore Edge only through its pinned taskbar icon; never type into Explorer."""
     try:
-        await get_mgr().execute(commands.a_open_app("msedge") + [("wait", 2.0)])
-        await update.message.reply_text("✅ Opening Microsoft Edge")
+        mgr = get_mgr()
+        await mgr.ensure()
+        opened = await _focus_edge_window(mgr)
+        if opened:
+            await update.message.reply_text("✅ Microsoft Edge open/focus confirmed.")
+        else:
+            await update.message.reply_text("❌ Edge taskbar icon/window not confirmed. No shell command was sent; /screen check karo.")
     except Exception as e:
         log.exception("edge failed")
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ Edge open/focus failed: {e}")
 
 
 async def _ctrl_flow(update: Update, word: str) -> None:
@@ -2025,6 +2103,10 @@ def main() -> None:
     app.add_handler(CommandHandler("rdp", cmd_switch))
     app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("edge", cmd_edge))
+    app.add_handler(CommandHandler("minimize", cmd_minimize))
+    app.add_handler(CommandHandler("maximize", cmd_maximize))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("split", cmd_split))
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))

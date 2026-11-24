@@ -66,9 +66,22 @@ class TestWiring(BotTestCase):
         for name in (
             "cmd_start", "cmd_add", "cmd_remove", "cmd_list", "cmd_switch", "cmd_connect",
             "cmd_cancel", "cmd_disconnect", "cmd_status", "cmd_screen", "cmd_win", "cmd_ctrl",
+            "cmd_minimize", "cmd_maximize", "cmd_close", "cmd_split",
             "on_igflow_callback", "cmd_instagram", "cmd_igdm", "on_message",
         ):
             self.assertTrue(hasattr(bot, name), f"missing handler: {name}")
+
+    def test_window_commands_send_focused_window_shortcuts(self):
+        fake = self.use_fake()
+        fake.ensure = AsyncMock()
+        update, msg = make_update("/window")
+        asyncio.run(bot.cmd_minimize(update, MagicMock()))
+        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "alt+space"), ("key", "n")])
+        asyncio.run(bot.cmd_maximize(update, MagicMock()))
+        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "win+up")])
+        asyncio.run(bot.cmd_close(update, MagicMock()))
+        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "alt+f4")])
+        self.assertEqual(msg.reply_text.await_count, 3)
 
     def test_open_chrome(self):
         fake = self.use_fake()
@@ -217,18 +230,25 @@ class TestInstagramGuidedFlow(BotTestCase):
         self.assertIn(("click", 40, 307, 1, False), actions)
         self.assertIn("Koi DM send nahi hua", query.message.reply_text.await_args.args[0])
 
-    def test_connect_shows_open_instagram_button_for_both_rdp_types(self):
+    def test_connect_shows_instagram_button_and_autofocuses_edge_only_on_desktop(self):
         from types import SimpleNamespace
-        for host, port in (("103.76.214.2", 65430), ("192.0.2.10", 3389)):
-            fake = self.use_fake()
-            fake.client = SimpleNamespace(width=1366, height=768)
-            fake.connect = AsyncMock()
-            bot.profiles["rdp1"] = {"host": host, "port": port}
-            update, msg = make_update("/connect rdp1")
-            asyncio.run(bot._do_connect(update, "rdp1"))
-            markup = msg.reply_text.await_args.kwargs["reply_markup"]
-            self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igflow:open")
-            self.assertTrue(fake.connect.awaited)
+        old_focus = bot._focus_edge_window
+        focus = AsyncMock(return_value=True)
+        bot._focus_edge_window = focus
+        try:
+            for host, port in (("103.76.214.2", 65430), ("192.0.2.10", 3389)):
+                fake = self.use_fake()
+                fake.client = SimpleNamespace(width=1366, height=768)
+                fake.connect = AsyncMock()
+                bot.profiles["rdp1"] = {"host": host, "port": port}
+                update, msg = make_update("/connect rdp1")
+                asyncio.run(bot._do_connect(update, "rdp1"))
+                markup = msg.reply_text.await_args.kwargs["reply_markup"]
+                self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igflow:open")
+                self.assertTrue(fake.connect.awaited)
+            focus.assert_awaited_once()
+        finally:
+            bot._focus_edge_window = old_focus
 
 
 class TestWebNavigation(BotTestCase):
