@@ -32,7 +32,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         return image
 
     def setUp(self):
-        self.bot = SimpleNamespace()
+        self.bot = SimpleNamespace(_focus_edge_window=AsyncMock(return_value=True))
         self.chat_id = 99
         automa_features.flows.pop(self.chat_id, None)
 
@@ -58,6 +58,23 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertEqual(flow.completed_targets, set(automa_features._target_keys(flow)))
         self.assertEqual(mgr.screenshot.await_count, 2)
 
+    def test_start_runs_selected_saved_workflow_row(self):
+        index, row_y = 2, 335 + 80*2
+        play_img = Image.new("RGB", (1366, 768), "white")
+        ImageDraw.Draw(play_img).line([(756,row_y-6),(765,row_y),(756,row_y+6),(756,row_y-6)], fill="black", width=2)
+        flow = ChatFlow(confirmed=True, selected={1}, saved_workflow_index=index, active_tabs=[0])
+        automa_features.flows[self.chat_id] = flow
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
+                              execute=AsyncMock(), screenshot=AsyncMock(return_value=play_img))
+        self.bot.get_mgr = MagicMock(return_value=mgr)
+        self.bot.mgr_key = lambda: "rdp1"
+        self.bot.log = MagicMock()
+        update, message = update_for_message(self.chat_id)
+        asyncio.run(automa_features.cmd_start(update, MagicMock(), self.bot))
+        clicks = [a for call in mgr.execute.await_args_list for a in call.args[0] if a[0] == "click"]
+        self.assertIn(("click", 760, row_y, 1, False), clicks)
+        self.assertIn("Saved workflow 3", message.reply_text.await_args.args[0])
+
     def test_start_requires_selected_groups_and_prepared_tabs(self):
         automa_features.flows[self.chat_id] = ChatFlow(workflow_name="Safe test")
         update, message = update_for_message(self.chat_id)
@@ -79,6 +96,32 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertIn("Repeatable workflow", message.reply_text.await_args.args[0])
         self.assertEqual(flow.run_completed, 1)
 
+    def test_workflow_command_shows_screenshot_and_five_choices(self):
+        image = Image.new("RGB", (1366, 768), "white")
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
+                              execute=AsyncMock(), screenshot=AsyncMock(return_value=image))
+        bot = SimpleNamespace(get_mgr=lambda: mgr, _focus_edge_window=AsyncMock(return_value=True),
+                              mgr_key=lambda: "rdp1", log=MagicMock())
+        update, message = update_for_message(self.chat_id)
+        asyncio.run(automa_features.cmd_workflow(update, MagicMock(), bot))
+        message.reply_photo.assert_awaited_once()
+        keyboard = message.reply_photo.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(len(keyboard), 5)
+        self.assertEqual(keyboard[4][0].callback_data, "automa:workflow:4")
+
+    def test_saved_workflow_selection_is_recorded_without_running(self):
+        from types import SimpleNamespace
+        flow = ChatFlow()
+        automa_features.flows[self.chat_id] = flow
+        query = SimpleNamespace(data="automa:workflow:2", answer=AsyncMock(),
+                                 edit_message_caption=AsyncMock())
+        update = SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=self.chat_id))
+        context = SimpleNamespace(user_data={})
+        asyncio.run(automa_features.on_automa_control(update, context, self.bot))
+        self.assertEqual(flow.saved_workflow_index, 2)
+        self.assertEqual(flow.workflow_name, None)
+        query.edit_message_caption.assert_awaited_once()
+
     def test_register_wires_requested_commands(self):
         from telegram.ext import CommandHandler
         app = MagicMock()
@@ -86,7 +129,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         automa_features.register(app, bot)
         commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list
                     if isinstance(call.args[0], CommandHandler)]
-        self.assertEqual(set(commands), {"fetchgc", "done", "setautoma", "start", "stop"})
+        self.assertEqual(set(commands), {"fetchgc", "done", "workflow", "setautoma", "start", "stop"})
 
     def test_run_button_classifier_distinguishes_play_and_stop(self):
         play_img = Image.new("RGB", (1366, 768), "white")

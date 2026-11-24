@@ -67,10 +67,10 @@ def _target_keys(flow: ChatFlow) -> list[str]:
     return [hashlib.sha256(f"{digest}:{profile}:{idx}".encode()).hexdigest() for idx in sorted(flow.selected)]
 
 
-def _classify_run_control(image: Image.Image) -> str:
-    """Conservatively distinguish the Automa play triangle from a solid stop square."""
+def _classify_run_control(image: Image.Image, row_center_y: int = 335) -> str:
+    """Distinguish the selected Automa row's Play triangle from its Stop square."""
     sx, sy = image.width / 1366.0, image.height / 768.0
-    cx, cy = int(760*sx), int(335*sy)
+    cx, cy = int(760*sx), int(row_center_y*sy)
     crop = image.convert("RGB").crop((cx-int(9*sx), cy-int(10*sy), cx+int(9*sx), cy+int(10*sy)))
     w, h = crop.size
     points = [(i % w, i // w) for i, (r, g, b) in enumerate(crop.get_flattened_data()) if max(r, g, b) < 100]
@@ -88,15 +88,20 @@ def _classify_run_control(image: Image.Image) -> str:
     return "unknown"
 
 
-async def _open_automa_dashboard(bot, mgr) -> None:
-    """Open Automa through the pinned Edge extension icon, then Dashboard."""
+async def _open_automa_popup(bot, mgr) -> None:
+    """Open the Automa extension popup without navigating away from the page."""
     await mgr.ensure()
     if not await bot._focus_edge_window(mgr):
-        raise RuntimeError("Edge window could not be focused; refusing dashboard clicks")
+        raise RuntimeError("Edge window could not be focused; refusing Automa clicks")
     x, y = _scale(mgr, 838, 67)
+    await mgr.execute([("click", x, y, 1, False), ("wait", 1.0)])
+
+
+async def _open_automa_dashboard(bot, mgr) -> None:
+    """Open Automa through the pinned Edge extension icon, then Dashboard."""
+    await _open_automa_popup(bot, mgr)
     hx, hy = _scale(mgr, 798, 136)
-    await mgr.execute([("click", x, y, 1, False), ("wait", 0.8),
-                       ("click", hx, hy, 1, False), ("wait", 3.0)])
+    await mgr.execute([("click", hx, hy, 1, False), ("wait", 3.0)])
 
 
 async def cmd_fetchgc(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -169,13 +174,40 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
         flow.active_tabs = list(range(len(selected)))
         image = await mgr.screenshot()
         buf = io.BytesIO(); image.save(buf, format="PNG"); buf.seek(0)
+        workflow_selected = bool(flow.workflow_name) or flow.saved_workflow_index is not None
         caption = (f"{len(selected)} selected chat tab(s) prepared. Workflow abhi nahi chala. Verify tabs/screens, then /start."
-                   if flow.workflow_name else f"{len(selected)} selected chat tab(s) prepared. Ab /setautoma se workflow import karo; koi workflow run nahi hua.")
+                   if workflow_selected else f"{len(selected)} selected chat tab(s) prepared. Ab /workflow se saved workflow chuno ya /setautoma se naya JSON import karo; koi workflow run nahi hua.")
         await update.message.reply_photo(photo=buf, caption=caption)
     except Exception as exc:
         flow.active_tabs = []
         bot.log.exception("/done tab preparation failed")
         await update.message.reply_text(f"❌ Tabs prepare nahi hue: {exc}")
+
+
+async def cmd_workflow(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
+    """Show the first five workflows from the Automa extension popup."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("/workflow sirf private Telegram chat mein use karo.")
+        return
+    try:
+        mgr = bot.get_mgr()
+        await _open_automa_popup(bot, mgr)
+        image = await mgr.screenshot()
+        # Close the popup after capturing it so /start can reopen it predictably.
+        await mgr.execute([("key", "escape"), ("wait", 0.3)])
+        flow = flows.setdefault(update.effective_chat.id, ChatFlow())
+        flow.profile = bot.mgr_key()
+        buttons = [[InlineKeyboardButton(f"Select workflow {i+1}", callback_data=f"automa:workflow:{i}")]
+                   for i in range(5)]
+        buf = io.BytesIO(); image.save(buf, format="PNG"); buf.seek(0)
+        await update.message.reply_photo(
+            photo=buf,
+            caption="Automa popup ka screenshot: pehle paanch workflows upar se neeche dekho, phir usi number ko select karo. Selection sirf workflow choose karti hai; run /start se hoga.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    except Exception as exc:
+        bot.log.exception("/workflow listing failed")
+        await update.message.reply_text(f"❌ Automa workflows nahi dikhe: {exc}")
 
 
 async def cmd_setautoma(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -187,6 +219,11 @@ async def cmd_setautoma(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
         await _open_automa_dashboard(bot, mgr)
         flow = flows.setdefault(update.effective_chat.id, ChatFlow())
         flow.profile = bot.mgr_key()
+        flow.saved_workflow_index = None
+        flow.workflow_name = None
+        flow.workflow_bytes = None
+        flow.workflow_digest = None
+        flow.run_state = None
         context.user_data["automa_upload_pending"] = True
         await update.message.reply_text("Automa dashboard khol diya. Ab apna exported .json workflow isi private chat mein document bana kar bhejo. Workflow import hoga; upload par run nahi hoga.")
     except Exception as exc:
@@ -206,23 +243,33 @@ def get_download(token: str):
     return entry, _download_names.get(token, entry.filename)
 
 
+async def _open_selected_workflow_popup(flow: ChatFlow, bot, mgr) -> tuple[Image.Image, int]:
+    """Open Automa and position its selected saved/imported workflow row."""
+    await _open_automa_popup(bot, mgr)
+    if flow.saved_workflow_index is not None:
+        row_y = 335 + 80 * flow.saved_workflow_index
+    else:
+        if not flow.workflow_name:
+            raise RuntimeError("No workflow selected")
+        sx, sy = _scale(mgr, 650, 192)
+        await mgr.execute([("click", sx, sy, 1, False), ("key", "ctrl+a"),
+                           ("text", flow.workflow_name), ("wait", 0.8)])
+        row_y = 335
+    return await mgr.screenshot(), row_y
+
+
 async def _run_flow_once_per_tab(flow: ChatFlow, bot) -> int:
-    """Run the selected workflow once per prepared tab, only when Play is visible."""
+    """Run the selected workflow once per prepared tab; workflow loops stay intact."""
     flow.completed_targets.update(_target_keys(flow))
     flow.run_state = "starting"
     flow.run_completed = 0
     mgr = bot.get_mgr(flow.profile)
     await mgr.ensure()
     for _ in flow.active_tabs:
-        x, y = _scale(mgr, 838, 67)
-        sx, sy = _scale(mgr, 650, 192)
-        rx, ry = _scale(mgr, 760, 335)
-        await mgr.execute([("click", x, y, 1, False), ("wait", 0.8),
-                           ("click", sx, sy, 1, False), ("key", "ctrl+a"),
-                           ("text", flow.workflow_name), ("wait", 0.8)])
-        image = await mgr.screenshot()
-        if _classify_run_control(image) != "play":
-            raise RuntimeError("Automa play control not positively identified; stopped before clicking")
+        image, row_y = await _open_selected_workflow_popup(flow, bot, mgr)
+        if _classify_run_control(image, row_y) != "play":
+            raise RuntimeError("Selected workflow Play control not detected; no click sent")
+        rx, ry = _scale(mgr, 760, row_y)
         await mgr.execute([("click", rx, ry, 1, False), ("wait", 1.0)])
         flow.run_completed += 1
         if flow.run_completed < len(flow.active_tabs):
@@ -262,6 +309,7 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
         flow.run_completed = 0
     flow.workflow_digest = digest
     flow.workflow_name = summary.name
+    flow.saved_workflow_index = None
     flow.workflow_bytes = raw
     flow.send_clicks = summary.send_clicks
     flow.profile = flow.profile or bot.mgr_key()
@@ -299,12 +347,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> 
     if not flow or not flow.confirmed or not flow.active_tabs:
         await update.message.reply_text("Pehle /fetchgc → groups select → /done se tabs ready karo.")
         return
-    if not flow.workflow_name:
-        await update.message.reply_text("Pehle /setautoma se workflow import karo.")
+    if not flow.workflow_name and flow.saved_workflow_index is None:
+        await update.message.reply_text("Pehle /workflow se saved workflow select karo ya /setautoma se naya JSON import karo.")
         return
+    label = flow.workflow_name or f"Saved workflow {flow.saved_workflow_index + 1}"
     try:
         count = await _run_flow_once_per_tab(flow, bot)
-        await update.message.reply_text(f"Run clicks bheje: ‘{flow.workflow_name}’ ek baar per selected tab ({count}). /stop se rukao; /screen se status verify karo.")
+        await update.message.reply_text(f"Run clicks bheje: ‘{label}’ selected tab(s) par ({count}). Workflow ke apne repeat/loop blocks as-is chalenge. /stop se rukao; /screen se verify karo.")
     except Exception as exc:
         flow.run_state = "partial"
         bot.log.exception("/start Automa run failed")
@@ -318,19 +367,16 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
         return
     try:
         mgr = bot.get_mgr(flow.profile)
+        await mgr.ensure()
         clicked = 0
-        for _ in flow.active_tabs:
-            x, y = _scale(mgr, 838, 67)
-            search_x, search_y = _scale(mgr, 650, 192)
-            rx, ry = _scale(mgr, 760, 335)
-            await mgr.execute([("click", x, y, 1, False), ("wait", 0.8),
-                               ("click", search_x, search_y, 1, False), ("key", "ctrl+a"),
-                               ("text", flow.workflow_name or ""), ("wait", 0.8)])
-            image = await mgr.screenshot()
-            if _classify_run_control(image) == "stop":
+        for position, _ in enumerate(flow.active_tabs):
+            image, row_y = await _open_selected_workflow_popup(flow, bot, mgr)
+            rx, ry = _scale(mgr, 760, row_y)
+            if _classify_run_control(image, row_y) == "stop":
                 await mgr.execute([("click", rx, ry, 1, False), ("wait", 1.0)])
                 clicked += 1
-            await mgr.execute([("key", "ctrl+shift+tab")])
+            if position < len(flow.active_tabs) - 1:
+                await mgr.execute([("key", "ctrl+shift+tab")])
         flow.run_state = "stopped" if clicked else "finished-or-not-detected"
         await update.message.reply_text(f"Stop click {clicked}/{len(flow.active_tabs)} tab(s) par bheja. Agar stop icon nahi dikha to click nahi kiya—/screen se status verify karo.")
     except Exception as exc:
@@ -339,13 +385,34 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
 
 
 async def on_automa_control(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Reject stale confirmation buttons from earlier versions of this bot."""
     query = update.callback_query
     await query.answer()
+    flow = flows.get(update.effective_chat.id)
+    if query.data.startswith("automa:workflow:"):
+        if not flow:
+            await query.edit_message_caption(caption="Session expire ho gayi; /workflow dobara chalao.")
+            return
+        try:
+            index = int(query.data.rsplit(":", 1)[-1])
+            if not 0 <= index < 5:
+                raise ValueError("out of range")
+        except ValueError:
+            await query.answer("Invalid workflow selection", show_alert=True)
+            return
+        flow.saved_workflow_index = index
+        flow.workflow_name = None
+        flow.workflow_bytes = None
+        flow.workflow_digest = None
+        flow.run_state = None
+        context.user_data["automa_upload_pending"] = False
+        await query.edit_message_caption(
+            caption=f"Saved workflow #{index+1} selected (row {index+1} in the screenshot). It has not run yet. Prepare chats with /fetchgc → /done, then /start."
+        )
+        return
     if query.data == "automa:run-cancel":
         await query.edit_message_text("Run cancel kiya; workflow nahi chala.")
     else:
-        await query.edit_message_text("Purana confirmation button expire ho gaya. Agar intended ho to /start bhejo.")
+        await query.edit_message_text("Old confirmation button. If intended, send /start.")
 
 
 def register(app, bot) -> None:
@@ -353,6 +420,7 @@ def register(app, bot) -> None:
     from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
     app.add_handler(CommandHandler("fetchgc", bot.guarded(lambda u, c: cmd_fetchgc(u, c, bot))))
     app.add_handler(CommandHandler("done", bot.guarded(lambda u, c: cmd_done(u, c, bot))))
+    app.add_handler(CommandHandler("workflow", bot.guarded(lambda u, c: cmd_workflow(u, c, bot))))
     app.add_handler(CommandHandler("setautoma", bot.guarded(lambda u, c: cmd_setautoma(u, c, bot))))
     app.add_handler(CommandHandler("start", bot.guarded(lambda u, c: cmd_start(u, c, bot))))
     app.add_handler(CommandHandler("stop", bot.guarded(lambda u, c: cmd_stop(u, c, bot))))

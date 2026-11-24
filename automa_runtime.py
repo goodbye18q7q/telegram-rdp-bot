@@ -24,6 +24,7 @@ class ChatFlow:
     workflow_name: str | None = None
     workflow_bytes: bytes | None = None
     workflow_digest: str | None = None
+    saved_workflow_index: int | None = None
     completed_targets: set[str] = field(default_factory=set)
     send_clicks: int = 0
     profile: str | None = None
