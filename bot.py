@@ -103,8 +103,9 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /igdm — show the Open Messages button (use when Instagram is loaded and signed in).
 /fetchgc — show up to five recent Instagram inbox chats for selection.
 /done — finalize chosen groups and prepare one browser tab per group.
-/setautoma — open Automa, then upload a workflow JSON in this private chat.
-/start — run the imported workflow in the selected tab(s).
+/workflow — show the first five saved Automa workflows to select.
+/setautoma — request and import a new workflow JSON in this private chat.
+/start — run the selected/imported workflow in the selected tab(s).
 /stop — stop the active workflow on selected tabs.
 After /connect — tap 📸 Open Instagram, then follow the private login prompts; DMs open after OTP.
 /install adblock — open the Chrome Web Store
