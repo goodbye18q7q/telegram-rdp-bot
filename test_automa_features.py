@@ -32,6 +32,14 @@ class TestAutomaFeatureControls(unittest.TestCase):
         return image
 
     @staticmethod
+    def dashboard_image() -> Image.Image:
+        image = Image.new("RGB", (1366, 768), "white")
+        draw = ImageDraw.Draw(image)
+        for y in (125, 175, 225, 275, 325, 370):
+            draw.rectangle((22, y-5, 39, y+5), fill="black")
+        return image
+
+    @staticmethod
     def popup_image(row_y: int = 335, control: str = "play") -> Image.Image:
         image = Image.new("RGB", (1366, 768), "white")
         draw = ImageDraw.Draw(image)
@@ -146,6 +154,29 @@ class TestAutomaFeatureControls(unittest.TestCase):
         ImageDraw.Draw(stop_img).rectangle((1041,332,1047,338), fill="black")
         self.assertEqual(automa_features._classify_run_control(play_img), "play")
         self.assertEqual(automa_features._classify_run_control(stop_img), "stop")
+
+    def test_automa_dashboard_detection_skips_extension_clicks_when_already_open(self):
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
+                              screenshot=AsyncMock(return_value=self.dashboard_image()),
+                              execute=AsyncMock())
+        bot = SimpleNamespace(_focus_edge_window=AsyncMock(return_value=True))
+        asyncio.run(automa_features._open_automa_dashboard(bot, mgr))
+        mgr.execute.assert_not_awaited()
+        bot._focus_edge_window.assert_not_awaited()
+
+    def test_dashboard_detector_rejects_blank_white_page(self):
+        self.assertFalse(automa_features._automa_dashboard_visible(Image.new("RGB", (1366,768), "white")))
+        self.assertTrue(automa_features._automa_dashboard_visible(self.dashboard_image()))
+
+    def test_automa_popup_failure_stops_before_dashboard_page_click(self):
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768), ensure=AsyncMock(),
+                              screenshot=AsyncMock(return_value=Image.new("RGB", (1366,768), "white")),
+                              execute=AsyncMock())
+        bot = SimpleNamespace(_focus_edge_window=AsyncMock(return_value=True))
+        with self.assertRaisesRegex(RuntimeError, "popup was not detected"):
+            asyncio.run(automa_features._open_automa_popup(bot, mgr))
+        clicks = [a for call in mgr.execute.await_args_list for a in call.args[0] if a[0] == "click"]
+        self.assertEqual(clicks, [("click", 1122, 67, 1, False)])
 
     def test_edge_focus_retries_taskbar_restore_and_verifies_chrome(self):
         from bot import _focus_edge_window

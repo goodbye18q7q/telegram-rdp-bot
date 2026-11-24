@@ -71,9 +71,12 @@ class TestWiring(BotTestCase):
         ):
             self.assertTrue(hasattr(bot, name), f"missing handler: {name}")
 
-    def test_window_commands_send_focused_window_shortcuts(self):
+    def test_window_commands_send_shortcuts_and_close_until_desktop(self):
+        from PIL import Image
         fake = self.use_fake()
         fake.ensure = AsyncMock()
+        fake.screenshot = AsyncMock(side_effect=[Image.new("RGB",(1366,768),"white"),
+                                                 Image.new("RGB",(1366,768),(0,120,215))])
         update, msg = make_update("/window")
         asyncio.run(bot.cmd_minimize(update, MagicMock()))
         self.assertEqual(fake.execute.await_args_list[-1].args[0],
@@ -82,8 +85,19 @@ class TestWiring(BotTestCase):
         self.assertEqual(fake.execute.await_args_list[-1].args[0],
                          [("key", "alt+space"), ("wait", 0.5), ("key", "x"), ("wait", 0.7)])
         asyncio.run(bot.cmd_close(update, MagicMock()))
-        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "alt+f4")])
+        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "alt+f4"), ("wait", 0.8)])
+        self.assertIn("Closed 1 visible window", msg.reply_text.await_args.args[0])
         self.assertEqual(msg.reply_text.await_count, 3)
+
+    def test_close_does_not_send_alt_f4_on_desktop(self):
+        from PIL import Image
+        fake = self.use_fake()
+        fake.ensure = AsyncMock()
+        fake.screenshot = AsyncMock(return_value=Image.new("RGB",(1366,768),(0,120,215)))
+        update, msg = make_update("/close")
+        asyncio.run(bot.cmd_close(update, MagicMock()))
+        fake.execute.assert_not_awaited()
+        self.assertIn("Closed 0 visible window", msg.reply_text.await_args.args[0])
 
     def test_open_chrome(self):
         fake = self.use_fake()

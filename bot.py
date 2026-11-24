@@ -92,7 +92,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /edge                         — open or focus Microsoft Edge
 /minimize                     — minimize the focused RDP window
 /maximize                     — maximize the focused RDP window
-/close                        — close the focused window (not the RDP session)
+/close                        — close visible app windows until desktop; keep RDP connected
 /split                        — open Edge Split Screen for the current/next tab
 /open chrome — open any app (notepad, cmd, powershell, calc, mspaint...)
 /open instagram — open a website
@@ -1732,9 +1732,48 @@ async def cmd_maximize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                           "✅ Maximize command sent to the focused window.")
 
 
+def _looks_like_windows_desktop(image) -> bool:
+    """Recognize the blue desktop used by this RDP profile before sending Alt+F4."""
+    width, height = image.size
+    crop = image.convert("RGB").crop((int(width*.12), int(height*.12), int(width*.88), int(height*.86)))
+    pixels = list(crop.get_flattened_data())
+    if not pixels:
+        return False
+    blue = sum(b > r*1.15 and b > g*1.05 and b > 80 for r, g, b in pixels)
+    return blue / len(pixels) > 0.65
+
+
 @guarded
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _window_command(update, [("key", "alt+f4")], "✅ Close shortcut sent to the focused window (RDP session stays connected).")
+    """Close visible app windows in turn; stop at desktop, keep the RDP session."""
+    try:
+        mgr = get_mgr()
+        await mgr.ensure()
+        closed = 0
+        for _ in range(15):
+            before = await mgr.screenshot()
+            if _looks_like_windows_desktop(before):
+                break
+            await mgr.execute([("key", "alt+f4"), ("wait", 0.8)])
+            closed += 1
+            after = await mgr.screenshot()
+            if _looks_like_windows_desktop(after):
+                break
+            # If a dialog/window did not visibly go away, stop rather than
+            # sending more close keystrokes that could discard unsaved work.
+            if diff_ratio(before, after) < 0.004:
+                await update.message.reply_text(
+                    f"⚠️ {closed} close shortcut(s) sent, but a window did not visibly close. "
+                    "Possible save/confirmation dialog left untouched; check /screen. RDP session remains connected."
+                )
+                return
+        await update.message.reply_text(
+            f"✅ Closed {closed} visible window(s) until the desktop appeared. RDP session remains connected. "
+            "Unsaved-work dialogs are not auto-confirmed."
+        )
+    except Exception as e:
+        log.exception("close-all failed")
+        await update.message.reply_text(f"❌ Close-all failed: {e}")
 
 
 @guarded

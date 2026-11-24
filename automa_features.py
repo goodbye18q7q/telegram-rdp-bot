@@ -98,9 +98,14 @@ def _automa_popup_visible(image: Image.Image) -> bool:
 
 def _automa_dashboard_visible(image: Image.Image) -> bool:
     sx, sy = image.width / 1366.0, image.height / 768.0
+    rgb = image.convert("RGB")
     box = (int(100*sx), int(90*sy), int(1300*sx), int(700*sy))
-    pixels = list(image.convert("RGB").crop(box).get_flattened_data())
-    return bool(pixels) and sum(min(rgb) > 230 for rgb in pixels) / len(pixels) > 0.82
+    pixels = list(rgb.crop(box).get_flattened_data())
+    sidebar = list(rgb.crop((0, int(90*sy), int(60*sx), int(390*sy))).get_flattened_data())
+    white_ratio = sum(min(px) > 230 for px in pixels) / max(1, len(pixels))
+    sidebar_ink = sum(max(px) < 100 for px in sidebar) / max(1, len(sidebar))
+    # The dark navigation icons distinguish the dashboard from a blank white tab.
+    return white_ratio > 0.82 and sidebar_ink > 0.03
 
 
 async def _maximize_edge(mgr) -> None:
@@ -122,8 +127,20 @@ async def _open_automa_popup(bot, mgr) -> None:
         raise RuntimeError("Automa popup was not detected; stopped before clicking the page")
 
 
+async def _focus_existing_automa_dashboard(mgr) -> bool:
+    """Restore the standalone Automa dashboard from its pinned taskbar icon."""
+    x, y = _scale(mgr, 565, 748)
+    await mgr.execute([("click", x, y, 1, False), ("wait", 1.0)])
+    return _automa_dashboard_visible(await mgr.screenshot())
+
+
 async def _open_automa_dashboard(bot, mgr) -> None:
-    """Open Automa Dashboard only after confirming its extension popup."""
+    """Use an already-open dashboard, restore it from taskbar, or launch it safely."""
+    await mgr.ensure()
+    if _automa_dashboard_visible(await mgr.screenshot()):
+        return
+    if await _focus_existing_automa_dashboard(mgr):
+        return
     await _open_automa_popup(bot, mgr)
     hx, hy = _scale(mgr, 1366-284, 136)
     await mgr.execute([("click", hx, hy, 1, False), ("wait", 3.0)])
@@ -346,11 +363,13 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         mgr = bot.get_mgr(flow.profile)
         base = _base_url()
-        # Dashboard is a separate window; switch to Edge, download the temporary
-        # JSON, then return to Automa's import control.
-        await mgr.execute([("key", "alt+tab"), ("wait", 0.5),
-                           ("click", int(mgr.client.width*0.29), int(mgr.client.height*0.09), 1, False),
-                           ("key", "ctrl+l"), ("text", f"{base}/automa-file/{token}"), ("key", "enter"), ("wait", 6.0)])
+        # Download the Telegram-uploaded JSON in Edge, then restore the existing
+        # Automa app/dashboard. Avoid Alt+Tab and fixed page clicks here.
+        if not await bot._focus_edge_window(mgr):
+            raise RuntimeError("Edge could not be focused for the temporary workflow download")
+        await _maximize_edge(mgr)
+        await mgr.execute([("key", "ctrl+l"), ("text", f"{base}/automa-file/{token}"),
+                           ("key", "enter"), ("wait", 6.0)])
         await _open_automa_dashboard(bot, mgr)
         x, y = _scale(mgr, 1080, 179)
         username = (mgr.cfg.get("rdp_user") or "testing").split("\\")[-1]
