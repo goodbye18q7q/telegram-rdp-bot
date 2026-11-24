@@ -93,7 +93,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /search wallpaper 4k — search + numbered list (1,2,3...) → reply 1 to open
 /search instagram — shows 1) insta 2) etc → tap 1 to open in RDP Chrome
 /goto instagram.com — open a URL directly
-/instagram — open Instagram directly
+/instagram — Instagram login + OTP flow (private chat)
 /iglogin — bot-assisted one-time Instagram login (private chat only)
 /igotp <code> — submit Instagram's one-time verification code
 /install adblock — open the Chrome Web Store
@@ -1811,6 +1811,7 @@ def main() -> None:
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("instagram", cmd_iglogin))
     app.add_handler(CommandHandler("iglogin", cmd_iglogin))
     app.add_handler(CommandHandler("igotp", cmd_igotp))
     app.add_handler(CommandHandler("fix", cmd_fix))
