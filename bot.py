@@ -1545,7 +1545,7 @@ async def cmd_igotp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id if update.effective_chat else 0
     session = ig_login_sessions.get(chat_id)
     if not session or session.get("step") != "otp":
-        await update.message.reply_text("Pehle /iglogin flow chalao aur Instagram OTP prompt aane do.")
+        await update.message.reply_text("Pehle /instagram chalao, login ke baad Instagram OTP prompt aane do.")
         return
     if update.effective_chat.type != "private":
         await update.message.reply_text("🔒 OTP sirf bot ke private DM mein bhejo.")
@@ -1560,22 +1560,25 @@ async def cmd_igotp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("🔒 OTP message delete nahi hua, isliye code submit nahi kiya. Message khud delete karke /igotp dobara bhejo.")
         return
 
-    ig_login_sessions.pop(chat_id, None)
     try:
         mgr = get_mgr()
         if not mgr.is_connected:
-            await update.effective_chat.send_message("❌ RDP disconnected hai; OTP submit nahi hua. /connect karke flow dobara chalao.")
+            await update.effective_chat.send_message("❌ RDP disconnected hai; OTP submit nahi hua. /connect karke dobara try karo.")
             return
         width, height = mgr.client.width, mgr.client.height
+        # Instagram's email-code challenge places the Code field low in the
+        # centered card, with Continue near the bottom; don't reuse login-page coords.
         await mgr.execute([
-            ("click", int(width * 0.75), int(height * 0.35), 1, False),
-            ("wait", 0.2), ("key", "ctrl+a"), ("text", code), ("wait", 0.3),
-            ("click", int(width * 0.75), int(height * 0.54), 1, False), ("wait", 5.0),
+            ("click", int(width * 0.50), int(height * 0.80), 1, False),
+            ("wait", 0.3), ("key", "ctrl+a"), ("text", code), ("wait", 0.5),
+            ("click", int(width * 0.50), int(height * 0.955), 1, False), ("wait", 5.0),
         ])
-        await update.effective_chat.send_message("✅ Verification code submit kiya. /screen bhejo aur result check karo.")
+        # Keep only the pending-step marker (never the code), so the user can
+        # retry with a fresh code if Instagram leaves the challenge screen open.
+        await update.effective_chat.send_message("✅ OTP entry/Continue click bheja. /screen se confirm karo; code prompt rahe to naya code dekar /igotp dobara bhejo, ya /cancel karo.")
     except Exception:
         log.exception("Instagram OTP automation failed")
-        await update.effective_chat.send_message("❌ OTP submit nahi ho paya. /screen bhejo; code save nahi hua.")
+        await update.effective_chat.send_message("❌ OTP type/click nahi hua. /screen check karo; code save nahi hua—prompt rahe to /igotp dobara try karo.")
 
 
 @guarded

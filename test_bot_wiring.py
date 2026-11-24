@@ -42,6 +42,7 @@ class BotTestCase(unittest.TestCase):
         bot.profiles.clear()
         bot.managers.clear()
         bot.connect_sessions.clear()
+        bot.ig_login_sessions.clear()
         bot.current.update(name=None, host="", port=3389, user="", password="")
         bot.cfg["allowed_users"] = []
 
@@ -105,6 +106,26 @@ class TestWiring(BotTestCase):
         update, msg = make_update("/cmd ipconfig")
         asyncio.run(bot.on_message(update, MagicMock()))
         self.assertIn("Error", msg.reply_text.await_args[0][0])
+
+
+class TestInstagramOtp(BotTestCase):
+    def test_otp_targets_email_code_and_continue_controls(self):
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        update, msg = make_update("/igotp 123456")
+        update.effective_chat.type = "private"
+        update.effective_chat.send_message = AsyncMock()
+        msg.delete = AsyncMock()
+        bot.ig_login_sessions[555] = {"step": "otp"}
+
+        asyncio.run(bot.cmd_igotp(update, MagicMock(args=["123456"])))
+
+        self.assertTrue(msg.delete.awaited)
+        actions = fake.execute.await_args[0][0]
+        self.assertIn(("click", 683, 614, 1, False), actions)
+        self.assertIn(("click", 683, 733, 1, False), actions)
+        self.assertNotIn("123456", bot.ig_login_sessions[555].values())
 
 
 class TestWebNavigation(BotTestCase):
