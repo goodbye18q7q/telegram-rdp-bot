@@ -1717,15 +1717,18 @@ async def _window_command(update: Update, actions: list, success: str) -> None:
 
 @guarded
 async def cmd_minimize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # The system-menu Minimize mnemonic avoids a second Win+Down targeting a
-    # different window after the first press changes focus.
-    await _window_command(update, [("key", "alt+space"), ("key", "n")],
-                          "✅ Focused window minimized (RDP session stays connected).")
+    # Open the active window's system menu, wait for it to render, then choose
+    # Minimize by its English mnemonic. The delay is important over RDP.
+    await _window_command(update, [("key", "alt+space"), ("wait", 0.5), ("key", "n"), ("wait", 0.5)],
+                          "✅ Minimize command sent to the focused window (RDP session stays connected).")
 
 
 @guarded
 async def cmd_maximize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _window_command(update, [("key", "win+up")], "✅ Focused window maximized.")
+    # Use the active window's system menu, not Win+Up (which may be intercepted
+    # by the local RDP client). X is the standard Maximize mnemonic.
+    await _window_command(update, [("key", "alt+space"), ("wait", 0.5), ("key", "x"), ("wait", 0.7)],
+                          "✅ Maximize command sent to the focused window.")
 
 
 @guarded

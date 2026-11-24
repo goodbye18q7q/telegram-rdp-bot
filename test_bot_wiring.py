@@ -76,9 +76,11 @@ class TestWiring(BotTestCase):
         fake.ensure = AsyncMock()
         update, msg = make_update("/window")
         asyncio.run(bot.cmd_minimize(update, MagicMock()))
-        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "alt+space"), ("key", "n")])
+        self.assertEqual(fake.execute.await_args_list[-1].args[0],
+                         [("key", "alt+space"), ("wait", 0.5), ("key", "n"), ("wait", 0.5)])
         asyncio.run(bot.cmd_maximize(update, MagicMock()))
-        self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "win+up")])
+        self.assertEqual(fake.execute.await_args_list[-1].args[0],
+                         [("key", "alt+space"), ("wait", 0.5), ("key", "x"), ("wait", 0.7)])
         asyncio.run(bot.cmd_close(update, MagicMock()))
         self.assertEqual(fake.execute.await_args_list[-1].args[0], [("key", "alt+f4")])
         self.assertEqual(msg.reply_text.await_count, 3)
