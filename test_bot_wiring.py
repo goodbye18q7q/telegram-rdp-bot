@@ -66,7 +66,7 @@ class TestWiring(BotTestCase):
         for name in (
             "cmd_start", "cmd_add", "cmd_remove", "cmd_list", "cmd_switch", "cmd_connect",
             "cmd_cancel", "cmd_disconnect", "cmd_status", "cmd_screen", "cmd_win", "cmd_ctrl",
-            "on_message",
+            "cmd_igdm", "on_igdm_callback", "on_message",
         ):
             self.assertTrue(hasattr(bot, name), f"missing handler: {name}")
 
@@ -129,6 +129,39 @@ class TestInstagramOtp(BotTestCase):
         self.assertIn(("click", 683, 733, 1, False), actions)
         self.assertEqual([a[1] for a in actions if a[0] == "text"], list("123456"))
         self.assertNotIn("123456", bot.ig_login_sessions[555].values())
+
+
+class TestInstagramDmButton(BotTestCase):
+    def test_igdm_command_sends_private_inline_button(self):
+        update, msg = make_update("/igdm")
+        update.effective_chat.type = "private"
+        bot.cfg["allowed_users"] = [111]
+
+        asyncio.run(bot.cmd_igdm(update, MagicMock()))
+
+        markup = msg.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igdm:open")
+        self.assertIn("koi message send nahi karta", msg.reply_text.await_args.args[0])
+
+    def test_igdm_button_clicks_left_rail_messages_icon(self):
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        fake.ensure = AsyncMock()
+        bot.cfg["allowed_users"] = [111]
+        query = MagicMock()
+        query.answer = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_user.id = 111
+        update.effective_chat.type = "private"
+
+        asyncio.run(bot.on_igdm_callback(update, MagicMock()))
+
+        actions = fake.execute.await_args[0][0]
+        self.assertIn(("click", 35, 339, 1, False), actions)
+        self.assertIn("koi DM send nahi hua", query.message.reply_text.await_args.args[0])
 
 
 class TestWebNavigation(BotTestCase):

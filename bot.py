@@ -94,6 +94,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /search instagram — shows 1) insta 2) etc → tap 1 to open in RDP Chrome
 /goto instagram.com — open a URL directly
 /instagram — Instagram login + OTP flow (private chat)
+/igdm — button to open Instagram Direct Messages (private chat)
 /iglogin — bot-assisted one-time Instagram login (private chat only)
 /igotp <code> — submit Instagram's one-time verification code
 /install adblock — open the Chrome Web Store
@@ -1492,6 +1493,51 @@ async def on_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @guarded
+async def cmd_igdm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a Telegram button that clicks Instagram's Direct Messages icon."""
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await update.message.reply_text("🔒 /igdm button sirf bot ke private chat mein use karo.")
+        return
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📩 Open Instagram Messages", callback_data="igdm:open")
+    ]])
+    await update.message.reply_text(
+        "Button dabane par RDP mein Instagram ke left-side Messages icon (Search ke upar) par click hoga. "
+        "Yeh sirf DM section kholta hai—koi message send nahi karta. Instagram mein login hona zaroori hai.",
+        reply_markup=markup,
+    )
+
+
+async def on_igdm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    uid = update.effective_user.id if update.effective_user else 0
+    if cfg["allowed_users"] and uid not in cfg["allowed_users"]:
+        await query.answer("Not authorized", show_alert=True)
+        return
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await query.answer("Use this button in the bot's private chat", show_alert=True)
+        return
+    await query.answer("Opening Instagram Messages…")
+    try:
+        mgr = get_mgr()
+        await mgr.ensure()
+        width, height = mgr.client.width, mgr.client.height
+        # Instagram desktop left rail: Direct Messages/paper-plane icon is
+        # immediately above Search. Coordinates scale with the RDP resolution.
+        await mgr.execute([
+            ("click", int(width * 35 / 1366), int(height * 339 / 768), 1, False),
+            ("wait", 2.0),
+        ])
+        await query.message.reply_text(
+            "✅ Instagram Messages icon par click bheja. /screen se verify karo. "
+            "Yeh action sirf section kholta hai; koi DM send nahi hua."
+        )
+    except Exception as e:
+        log.exception("Instagram DM click failed")
+        await query.message.reply_text(f"❌ Messages icon click nahi hua: {e}")
+
+
+@guarded
 async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Black screen fix: disconnect + reconnect"""
     try:
@@ -1832,6 +1878,7 @@ def main() -> None:
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("instagram", cmd_iglogin))
+    app.add_handler(CommandHandler("igdm", cmd_igdm))
     app.add_handler(CommandHandler("iglogin", cmd_iglogin))
     app.add_handler(CommandHandler("igotp", cmd_igotp))
     app.add_handler(CommandHandler("fix", cmd_fix))
@@ -1840,6 +1887,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mouse", cmd_ui))
     app.add_handler(CommandHandler("ctrl", cmd_ctrl))
     app.add_handler(CallbackQueryHandler(on_search_callback, pattern=r"^search:"))
+    app.add_handler(CallbackQueryHandler(on_igdm_callback, pattern=r"^igdm:"))
     app.add_handler(MessageHandler(filters.TEXT, on_message))
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
