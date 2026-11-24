@@ -113,11 +113,13 @@ class TestInstagramOtp(BotTestCase):
         from types import SimpleNamespace
         fake = self.use_fake()
         fake.client = SimpleNamespace(width=1366, height=768)
+        fake.ensure = AsyncMock()
         update, msg = make_update("/igotp 123456")
         update.effective_chat.type = "private"
         update.effective_chat.send_message = AsyncMock()
+        update.effective_user.id = 111
         msg.delete = AsyncMock()
-        bot.ig_login_sessions[555] = {"step": "otp"}
+        bot.cfg["allowed_users"] = [111]
 
         asyncio.run(bot.cmd_igotp(update, MagicMock(args=["123456"])))
 

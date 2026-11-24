@@ -1543,11 +1543,11 @@ async def cmd_ctrl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_igotp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Submit an Instagram verification code once, after deleting its chat message."""
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    session = ig_login_sessions.get(chat_id)
-    if not session or session.get("step") != "otp":
-        await update.message.reply_text("Pehle /instagram chalao, login ke baad Instagram OTP prompt aane do.")
+    uid = update.effective_user.id if update.effective_user else 0
+    if not cfg["allowed_users"] or uid not in cfg["allowed_users"]:
+        await update.message.reply_text("🔒 OTP entry ke liye ALLOWED_USERS mein apna Telegram user ID set hona zaroori hai.")
         return
-    if update.effective_chat.type != "private":
+    if not update.effective_chat or update.effective_chat.type != "private":
         await update.message.reply_text("🔒 OTP sirf bot ke private DM mein bhejo.")
         return
     code = "".join(context.args or []).strip()
@@ -1560,8 +1560,10 @@ async def cmd_igotp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("🔒 OTP message delete nahi hua, isliye code submit nahi kiya. Message khud delete karke /igotp dobara bhejo.")
         return
 
+    ig_login_sessions.setdefault(chat_id, {"step": "otp"})
     try:
         mgr = get_mgr()
+        await mgr.ensure()
         if not mgr.is_connected:
             await update.effective_chat.send_message("❌ RDP disconnected hai; OTP submit nahi hua. /connect karke dobara try karo.")
             return
