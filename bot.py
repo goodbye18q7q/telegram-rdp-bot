@@ -1073,19 +1073,27 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
                 # sure the dialog owns focus, then select its previous history text.
                 await mgr.execute([("click", int(340*sx), int(266*sy), 1, False), ("wait", 0.5),
                                    ("key", "ctrl+a"), ("wait", 0.3)])
-                # This RemoteApp drops Unicode chars at the default 12 cps; type slowly
-                # so long URLs aren't truncated, then restore the user's normal rate.
-                old_cps = mgr.cfg.get("type_cps", 12.0)
-                try:
-                    mgr.cfg["type_cps"] = 1.5
-                    await mgr.execute([("text", word)])
-                finally:
-                    mgr.cfg["type_cps"] = old_cps
+                # This RemoteApp drops bulk text (often leaving only 'm'/'ch').
+                # Send one character at a time with a pause so every key reaches the Run field.
+                for char in word:
+                    # Separate execute calls matter on this RemoteApp: batching
+                    # chars into one action list drops keys even with wait actions.
+                    await mgr.execute([("text", char)])
+                    await asyncio.sleep(0.5)
                 await asyncio.sleep(0.8)
                 typed = await mgr.screenshot_nowait()
-                await mgr.execute([("click", int(273*sx), int(330*sy), 1, False), ("wait", 6.0)])
+                await mgr.execute([("click", int(273*sx), int(330*sy), 1, False), ("wait", 2.0)])
+                # RemoteApp sometimes acknowledges the click before the updated
+                # desktop frame arrives. Poll for a changed screen instead of
+                # treating the first stale frame as a failed launch.
                 final = await mgr.screenshot_nowait()
                 r_final = diff_ratio(typed, final)
+                for _ in range(10):
+                    if r_final > 0.02:
+                        break
+                    await asyncio.sleep(1.0)
+                    final = await mgr.screenshot_nowait()
+                    r_final = diff_ratio(typed, final)
                 log.info("taskmgr Run new task click %r -> diff from typed dialog %.3f", word, r_final)
                 # Keep the launched app in front; do not Alt+F4 the active window.
                 if r_final > 0.02:
@@ -1572,7 +1580,14 @@ async def cmd_igotp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # centered card, with Continue near the bottom; don't reuse login-page coords.
         await mgr.execute([
             ("click", int(width * 0.50), int(height * 0.80), 1, False),
-            ("wait", 0.3), ("key", "ctrl+a"), ("text", code), ("wait", 0.5),
+            ("wait", 0.3), ("key", "ctrl+a"),
+        ])
+        # As with the Run dialog, bundled text actions can lose characters on this host.
+        for char in code:
+            await mgr.execute([("text", char)])
+            await asyncio.sleep(0.25)
+        await mgr.execute([
+            ("wait", 0.4),
             ("click", int(width * 0.50), int(height * 0.955), 1, False), ("wait", 5.0),
         ])
         # Keep only the pending-step marker (never the code), so the user can

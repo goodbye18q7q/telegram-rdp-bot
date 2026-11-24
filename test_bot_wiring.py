@@ -124,9 +124,10 @@ class TestInstagramOtp(BotTestCase):
         asyncio.run(bot.cmd_igotp(update, MagicMock(args=["123456"])))
 
         self.assertTrue(msg.delete.awaited)
-        actions = fake.execute.await_args[0][0]
+        actions = [action for call in fake.execute.await_args_list for action in call.args[0]]
         self.assertIn(("click", 683, 614, 1, False), actions)
         self.assertIn(("click", 683, 733, 1, False), actions)
+        self.assertEqual([a[1] for a in actions if a[0] == "text"], list("123456"))
         self.assertNotIn("123456", bot.ig_login_sessions[555].values())
 
 
