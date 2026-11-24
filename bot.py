@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import parse_qs
@@ -42,6 +43,7 @@ from telegram.ext import (
 )
 
 import commands
+import automa_features
 from config import load_config
 from rdp_manager import RDPManager
 
@@ -93,10 +95,14 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /search wallpaper 4k — search + numbered list (1,2,3...) → reply 1 to open
 /search instagram — shows 1) insta 2) etc → tap 1 to open in RDP Chrome
 /goto instagram.com — open a URL directly
-/instagram — Instagram login + OTP flow (private chat)
-/igdm — button to open Instagram Direct Messages (private chat)
-/iglogin — bot-assisted one-time Instagram login (private chat only)
-/igotp <code> — submit Instagram's one-time verification code
+/instagram — launch Edge and open Instagram; then tap Start login or Open Messages.
+/igdm — show the Open Messages button (use when Instagram is loaded and signed in).
+/fetchgc — show up to five recent Instagram inbox chats for selection.
+/done — finalize chosen groups and prepare one browser tab per group.
+/setautoma — open Automa, then upload a workflow JSON in this private chat.
+/start — run the imported workflow once per selected tab (no repeat).
+/stop — stop the active workflow on selected tabs.
+After /connect — tap 📸 Open Instagram, then follow the private login prompts; DMs open after OTP.
 /install adblock — open the Chrome Web Store
 /cmd ipconfig — run a command in PowerShell
 /type hello — type text (unicode works too)
@@ -283,6 +289,19 @@ def fetch_search_results(query: str, count: int = 5) -> list[tuple[str, str]]:
     ]
 
 
+REMOTEAPP_PORTS = {65430, 8250}
+REMOTEAPP_HOSTS = {"103.76.214.2", "202.140.136.146"}
+
+
+def _is_remoteapp(mgr, host: str | None = None) -> bool:
+    host = host or mgr.cfg.get("rdp_host", "")
+    try:
+        port = int(mgr.cfg.get("rdp_port", 3389))
+    except (TypeError, ValueError):
+        port = 3389
+    return host in REMOTEAPP_HOSTS or port in REMOTEAPP_PORTS
+
+
 BROWSER_CANDIDATES = [
     "chrome",
     "chrome.exe",
@@ -296,22 +315,64 @@ BROWSER_CANDIDATES = [
 ]
 
 
-async def _open_url_for_profile(mgr, url: str, host: str | None = None) -> str | None:
-    """Open a URL without routing it through Windows Start search on full desktops."""
-    host = host or current.get("host", "")
-    if host == "103.76.214.2":
-        return await _open_browser_via_run(mgr, url)
+def _looks_like_edge_window(image) -> bool:
+    """Cheap positive check that Edge's tab/address-bar chrome is visible."""
+    gray = ImageOps.grayscale(image.crop((0, 0, image.width, min(100, image.height))))
+    hist = gray.histogram()
+    total = sum(hist)
+    if not total:
+        return False
+    bright = sum(hist[185:]) / total
+    return bright > 0.35
+
+
+async def _focus_edge_window(mgr) -> bool:
+    """Restore Edge from the taskbar and positively verify its chrome is visible."""
+    width, height = mgr.client.width, mgr.client.height
+    x, y = int(width * 0.341), int(height * 0.974)
+    for _ in range(2):
+        await mgr.execute([("click", x, y, 1, False), ("wait", 1.2)])
+        image = await mgr.screenshot_nowait()
+        if _looks_like_edge_window(image):
+            return True
+    return False
+
+
+async def _navigate_browser_addressbar(mgr, url: str) -> None:
+    """Navigate the foreground browser, typing slowly for RemoteApp reliability."""
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
-    # On ordinary Windows RDP, Edge is already open. Escape out of any Start
-    # search overlay, focus the browser address bar, replace all text, navigate.
+    width, height = mgr.client.width, mgr.client.height
     await mgr.execute([
         ("key", "escape"), ("wait", 0.2),
-        ("key", "escape"), ("wait", 0.2),
-        ("key", "ctrl+l"), ("wait", 0.3), ("key", "ctrl+a"),
-        ("text", url), ("wait", 0.3), ("key", "enter"), ("wait", 4.0),
+        ("click", int(width * 0.30), int(height * 0.08), 1, False),
+        ("key", "ctrl+a"), ("key", "backspace"),
     ])
-    return f"Navigation command sent to the current browser for {url}"
+    for char in url:
+        await mgr.execute([("text", char)])
+        await asyncio.sleep(0.12)
+    await mgr.execute([("key", "enter"), ("wait", 5.0)])
+
+
+async def _open_url_for_profile(mgr, url: str, host: str | None = None) -> str | None:
+    """Open a URL on either Tally RemoteApp or a regular Windows RDP desktop."""
+    host = host or current.get("host", "")
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    if _is_remoteapp(mgr, host):
+        # Launch the installed browser first, then navigate via its address bar.
+        # Passing a URL inside the Run command is lossy on RemoteApp shells.
+        opened = await _open_browser_via_run(mgr, None)
+    else:
+        # Prefer the pinned Edge taskbar icon on ordinary Windows desktops. The
+        # generic Win+R launcher can type into Explorer when its dialog is swallowed.
+        focused = await _focus_edge_window(mgr)
+        opened = "Opened: msedge" if focused else "Not found: msedge"
+    if not opened or "Not found" in opened:
+        return opened
+    await asyncio.sleep(2.0)
+    await _navigate_browser_addressbar(mgr, url)
+    return f"Navigated the current browser to {url}"
 
 
 async def _open_browser_via_run(mgr, url: str | None = None) -> str | None:
@@ -319,9 +380,9 @@ async def _open_browser_via_run(mgr, url: str | None = None) -> str | None:
     # Tally host is a RemoteApp shell: Win+R/Start keys can leak a stray "r"
     # into an already-open task dialog. Chrome is confirmed installed there, so
     # run exactly one command through the mouse-driven Task Manager path.
-    if mgr.cfg.get("rdp_host") == "103.76.214.2":
+    if _is_remoteapp(mgr):
         app = "chrome" if not url else f"chrome {url}"
-        log.info("Tally search: single Task Manager launch %r", app)
+        log.info("RemoteApp browser launch: %r", app)
         return await _win_via_freerdp(mgr, app)
     # Other hosts: retain candidate fallback.
     for cand in BROWSER_CANDIDATES:
@@ -469,6 +530,18 @@ def start_health_server() -> None:
                 parsed = urlparse(self.path)
                 path = parsed.path
                 qs = parse_qs(parsed.query)
+                if path.startswith("/automa-file/"):
+                    token = path.rsplit("/", 1)[-1]
+                    transfer = automa_features.get_download(token)
+                    if not transfer:
+                        self.send_response(404); self.send_header("Content-Type", "text/plain"); self.end_headers(); self.wfile.write(b"expired or missing"); return
+                    entry, filename = transfer
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(entry.content)))
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers(); self.wfile.write(entry.content); return
                 if path in ("/health", "/ok"):
                     self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"ok"); return
                 if path == "/ui" or path == "/":
@@ -632,27 +705,17 @@ async def _do_connect(update: Update, name: str | None = None) -> None:
         p = profiles.get(key, {})
         host = p.get("host", current["host"])
         port = p.get("port", current["port"])
-        await update.message.reply_text(f"✅ Connected: {key} — {host}:{port}")
-        # Tally RemoteApp (103.76...) pe connect hote hi chrome auto kholne ki koshish
-        if host == "103.76.214.2" and str(port) == "65430":
-            await update.message.reply_text("🔄 Tally RDP — chrome auto-open try kar raha hu...")
-            asyncio.create_task(_auto_chrome_for_tally(key))
+        open_instagram = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📸 Open Instagram", callback_data="igflow:open")
+        ]])
+        await update.message.reply_text(
+            f"✅ Connected: {key} — {host}:{port}\nTallyPrime/RDP desktop wahi rahega. Instagram kholne ke liye button dabao.",
+            reply_markup=open_instagram,
+        )
     except Exception as e:
         log.exception("connect failed")
         await update.message.reply_text(f"❌ Connection failed:\n{e}")
 
-
-
-async def _auto_chrome_for_tally(key: str):
-    await asyncio.sleep(2.5)
-    try:
-        mgr = managers.get(key)
-        if not mgr or not mgr.is_connected:
-            return
-        res = await _open_browser_via_run(mgr, "https://www.google.com")
-        log.info("auto chrome for %s: %s", key, res)
-    except Exception as e:
-        log.warning("auto chrome failed %s: %s", key, e)
 
 @guarded
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -956,7 +1019,7 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
         # Take base screenshot first
         try:
             desktop_simple = await mgr.screenshot()
-            if mgr.cfg.get("rdp_host") == "103.76.214.2":
+            if _is_remoteapp(mgr):
                 # Recover cleanly if a prior attempt left Create new task open.
                 await mgr.execute([("key", "escape"), ("wait", 0.4)])
                 desktop_simple = await mgr.screenshot_nowait()
@@ -965,7 +1028,7 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             return f"Not found: {word}"
         # Tally's RemoteApp swallows Win+R; go straight to the verified mouse-driven
         # Task Manager flow instead of typing a stray "r" into an existing dialog.
-        methods = [] if mgr.cfg.get("rdp_host") == "103.76.214.2" else ["win+r", "run"]
+        methods = [] if _is_remoteapp(mgr) else ["win+r", "run"]
         for method in methods:
             try:
                 log.info("Trying simple-rdp fallback method %s for %r", method, word)
@@ -1045,65 +1108,64 @@ async def _win_via_freerdp(mgr, word: str) -> str | None:
             r_tm = diff_ratio(base2, tm)
             sw, sh = mgr.client.width, mgr.client.height
             sx, sy = sw / 1366.0, sh / 768.0
-            # A minimized/background Task Manager may already exist; Ctrl+Shift+Esc
-            # can bring it forward with a small pixel diff. Identify its title text
-            # at the known window origin instead of relying on a large full-screen diff.
-            title_crop = tm.convert("RGB").crop((int(120*sx), int(108*sy), int(250*sx), int(132*sy)))
-            title_dark = sum(1 for px in title_crop.getdata() if max(px) < 140)
-            is_taskmgr = title_dark > 20
-            log.info("taskmgr probe diff %.3f title_dark %d at %dx%d", r_tm, title_dark, sw, sh)
-            if is_taskmgr:
-                # Task Manager may be visible but inactive behind Chrome. Activate
-                # its title bar first or the first menu click only changes focus.
-                await mgr.execute([("click", int(300*sx), int(118*sy), 1, False), ("wait", 0.3)])
-                # Expanded Task Manager reaches x≈776,y≈697; compact one ends near y≈469.
-                # A white pixel at this point indicates it's already expanded.
-                probe = tm.convert("RGB").getpixel((min(sw-1, int(0.52*sw)), min(sh-1, int(0.78*sh))))
-                already_expanded = sum(probe) / 3 > 190
-                if not already_expanded:
-                    await mgr.execute([("click", int(170*sx), int(444*sy), 1, False), ("wait", 1.5)])
-                # Open File menu, then click the actual Run new task menu item.
-                await mgr.execute([("click", int(128*sx), int(143*sy), 1, False), ("wait", 0.4),
-                                   ("click", int(185*sx), int(167*sy), 1, False), ("wait", 1.0)])
-                # Let the modal settle, then immediately type. Avoid an intermediate
-                # screenshot here: on this RemoteApp it can leave the modal unfocused.
-                await asyncio.sleep(0.6)
-                # We already clicked File > Run new task; focus the known Open field,
-                # replace prior history text, and physically click OK.
-                # Run new task opens with the Open field focused; click once to make
-                # sure the dialog owns focus, then select its previous history text.
-                await mgr.execute([("click", int(340*sx), int(266*sy), 1, False), ("wait", 0.5),
-                                   ("key", "ctrl+a"), ("wait", 0.3)])
-                # This RemoteApp drops bulk text (often leaving only 'm'/'ch').
-                # Send one character at a time with a pause so every key reaches the Run field.
-                for char in word:
-                    # Separate execute calls matter on this RemoteApp: batching
-                    # chars into one action list drops keys even with wait actions.
-                    await mgr.execute([("text", char)])
-                    await asyncio.sleep(0.5)
-                await asyncio.sleep(0.8)
-                typed = await mgr.screenshot_nowait()
-                await mgr.execute([("click", int(273*sx), int(330*sy), 1, False), ("wait", 2.0)])
-                # RemoteApp sometimes acknowledges the click before the updated
-                # desktop frame arrives. Poll for a changed screen instead of
-                # treating the first stale frame as a failed launch.
+            if _is_remoteapp(mgr):
+                # RemoteApp Task Manager may reopen in a small window at different
+                # coordinates. Maximize it with the standard system-menu shortcut,
+                # then use the stable File > Run new task positions.
+                await mgr.execute([("key", "alt+space"), ("wait", 0.25), ("key", "x"), ("wait", 0.7),
+                                   ("click", int(16*sx), int(32*sy), 1, False), ("wait", 0.35),
+                                   ("click", int(68*sx), int(55*sy), 1, False), ("wait", 1.0)])
+                field_x, field_y, ok_x, ok_y = int(230*sx), int(155*sy), int(160*sx), int(218*sy)
+            else:
+                # On ordinary Windows desktops, try the restored Task Manager menu
+                # only when its title text is present at the known window origin.
+                rgb = tm.convert("RGB")
+                title_crop = rgb.crop((int(120*sx), int(108*sy), int(250*sx), int(132*sy)))
+                title_dark = sum(1 for px in title_crop.getdata() if max(px) < 140)
+                is_taskmgr = title_dark > 20
+                log.info("taskmgr probe diff %.3f title_dark %d at %dx%d", r_tm, title_dark, sw, sh)
+                if is_taskmgr:
+                    await mgr.execute([("click", int(300*sx), int(118*sy), 1, False), ("wait", 0.3),
+                                       ("click", int(128*sx), int(143*sy), 1, False), ("wait", 0.4),
+                                       ("click", int(185*sx), int(167*sy), 1, False), ("wait", 1.0)])
+                    field_x, field_y, ok_x, ok_y = int(340*sx), int(266*sy), int(273*sx), int(330*sy)
+                else:
+                    log.info("Task Manager not detected; skip mouse-driven fallback")
+                    return f"Not found: {word}"
+            # Let the modal settle, then type only after focusing the known Open field.
+            await asyncio.sleep(0.6)
+            await mgr.execute([("click", field_x, field_y, 1, False), ("wait", 0.4),
+                               ("key", "ctrl+a"), ("wait", 0.3)])
+            # This RemoteApp drops bulk text (often leaving only 'm'/'ch').
+            # Send one character at a time with a pause so every key reaches the Run field.
+            for char in word:
+                # Separate execute calls matter on this RemoteApp: batching
+                # chars into one action list drops keys even with wait actions.
+                await mgr.execute([("text", char)])
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(0.8)
+            typed = await mgr.screenshot_nowait()
+            await asyncio.sleep(0.3)
+            await mgr.execute([("click", ok_x, ok_y, 1, False)])
+            await asyncio.sleep(2.0)
+            # RemoteApp sometimes acknowledges the click before the updated
+            # desktop frame arrives. Poll for a changed screen instead of
+            # treating the first stale frame as a failed launch.
+            final = await mgr.screenshot_nowait()
+            r_final = diff_ratio(typed, final)
+            for _ in range(10):
+                if r_final > 0.02:
+                    break
+                await asyncio.sleep(1.0)
                 final = await mgr.screenshot_nowait()
                 r_final = diff_ratio(typed, final)
-                for _ in range(10):
-                    if r_final > 0.02:
-                        break
-                    await asyncio.sleep(1.0)
-                    final = await mgr.screenshot_nowait()
-                    r_final = diff_ratio(typed, final)
-                log.info("taskmgr Run new task click %r -> diff from typed dialog %.3f", word, r_final)
-                # Keep the launched app in front; do not Alt+F4 the active window.
-                if r_final > 0.02:
-                    from PIL import ImageOps
-                    bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
-                    if bright > 0.05:
-                        return f"Opened: {word}"
-            else:
-                log.info("Task Manager did not open; skip Task Manager fallback")
+            log.info("taskmgr Run new task click %r -> diff from typed dialog %.3f", word, r_final)
+            # Keep the launched app in front; do not Alt+F4 the active window.
+            if r_final > 0.02:
+                from PIL import ImageOps
+                bright = sum(ImageOps.grayscale(final).histogram()[10:]) / (final.size[0]*final.size[1])
+                if bright > 0.05:
+                    return f"Opened: {word}"
         except Exception as e:
             log.warning("mouse-driven Task Manager fallback failed: %s", e)
         return f"Not found: {word}"
@@ -1492,49 +1554,106 @@ async def on_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except: pass
 
 
+def _instagram_after_open_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Start login", callback_data="igflow:login")],
+        [InlineKeyboardButton("📩 Open Messages", callback_data="igflow:messages")],
+    ])
+
+
+async def _click_instagram_messages(mgr) -> None:
+    width, height = mgr.client.width, mgr.client.height
+    # On the current Edge desktop layout, the paper-plane Messages icon is
+    # centered around x=40,y=307. The earlier y=339 coordinate hit Search.
+    await mgr.execute([
+        ("click", int(width * 40 / 1366), int(height * 307 / 768), 1, False),
+        ("wait", 2.0),
+    ])
+
+
 @guarded
 async def cmd_igdm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show a Telegram button that clicks Instagram's Direct Messages icon."""
+    """Show a private-chat button that only navigates to Instagram Messages."""
     if not update.effective_chat or update.effective_chat.type != "private":
-        await update.message.reply_text("🔒 /igdm button sirf bot ke private chat mein use karo.")
+        await update.message.reply_text("Instagram Messages button sirf bot ke private DM mein use karo.")
         return
     markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📩 Open Instagram Messages", callback_data="igdm:open")
+        InlineKeyboardButton("📩 Open Instagram Messages", callback_data="igflow:messages")
     ]])
     await update.message.reply_text(
-        "Button dabane par RDP mein Instagram ke left-side Messages icon (Search ke upar) par click hoga. "
-        "Yeh sirf DM section kholta hai—koi message send nahi karta. Instagram mein login hona zaroori hai.",
+        "Instagram pehle se loaded aur signed in ho tab button dabao. "
+        "Yeh sirf Messages section kholega; koi DM send nahi karega.",
         reply_markup=markup,
     )
 
 
-async def on_igdm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@guarded
+async def cmd_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Launch the right browser for this RDP type, then open Instagram."""
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await update.message.reply_text("Instagram flow sirf bot ke private DM mein use karo.")
+        return
+    try:
+        mgr = get_mgr()
+        await mgr.ensure()
+        result = await _open_url_for_profile(
+            mgr, "https://www.instagram.com/", current.get("host", "")
+        )
+        if not result or "Not found" in result:
+            await update.message.reply_text(
+                f"❌ Browser launch/open confirm nahi hua ({result or 'unknown'}). RDP screen check karo."
+            )
+            return
+        await update.message.reply_text(
+            "✅ Edge kholkar Instagram open kiya (Tally RemoteApp par Chrome use hoga). "
+            "Login chahiye to Start login dabao; agar pehle se logged in ho to Open Messages dabao.",
+            reply_markup=_instagram_after_open_keyboard(),
+        )
+    except Exception as e:
+        log.exception("/instagram failed")
+        await update.message.reply_text(f"❌ Instagram nahi khul paya: {e}")
+
+
+async def on_igflow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Private guided Instagram flow; the same navigation helper covers both RDP types."""
     query = update.callback_query
     uid = update.effective_user.id if update.effective_user else 0
     if cfg["allowed_users"] and uid not in cfg["allowed_users"]:
         await query.answer("Not authorized", show_alert=True)
         return
     if not update.effective_chat or update.effective_chat.type != "private":
-        await query.answer("Use this button in the bot's private chat", show_alert=True)
+        await query.answer("Use this flow in the bot's private chat", show_alert=True)
         return
-    await query.answer("Opening Instagram Messages…")
+    chat_id = update.effective_chat.id
+    action = (query.data or "").split(":", 1)[-1]
+    await query.answer("Opening…")
     try:
         mgr = get_mgr()
         await mgr.ensure()
-        width, height = mgr.client.width, mgr.client.height
-        # Current desktop layout: the Direct Messages paper-plane icon is at
-        # x≈40,y≈307. The old y=339 coordinate hit Search instead.
-        await mgr.execute([
-            ("click", int(width * 40 / 1366), int(height * 307 / 768), 1, False),
-            ("wait", 2.0),
-        ])
-        await query.message.reply_text(
-            "✅ Instagram Messages icon par click bheja. /screen se verify karo. "
-            "Yeh action sirf section kholta hai; koi DM send nahi hua."
-        )
+        if action == "open":
+            res = await _open_url_for_profile(mgr, "https://www.instagram.com/", current.get("host", ""))
+            await query.message.reply_text(
+                f"✅ Instagram opened. Agar signed out ho to Start login dabao; agar already logged in ho to Open Messages.\n{res or ''}",
+                reply_markup=_instagram_after_open_keyboard(),
+            )
+        elif action == "login":
+            res = await _open_url_for_profile(mgr, "https://www.instagram.com/accounts/login/", current.get("host", ""))
+            if not res or "Not found" in res:
+                await query.message.reply_text("❌ Login page open confirm nahi hua. /screen check karo.")
+                return
+            ig_login_sessions[chat_id] = {"step": "username"}
+            await query.message.reply_text(
+                "Username bhejo. Is private chat mein username ke baad password maangunga; password message delete hone ke baad hi RDP par type hoga."
+            )
+        elif action == "messages":
+            await _click_instagram_messages(mgr)
+            ig_login_sessions.pop(chat_id, None)
+            await query.message.reply_text("✅ Messages icon click kiya. Koi DM send nahi hua; /screen se verify karo.")
+        else:
+            await query.message.reply_text("Unknown Instagram action.")
     except Exception as e:
-        log.exception("Instagram DM click failed")
-        await query.message.reply_text(f"❌ Messages icon click nahi hua: {e}")
+        log.exception("Instagram guided flow failed")
+        await query.message.reply_text(f"❌ Instagram flow failed: {e}")
 
 
 @guarded
@@ -1673,8 +1792,15 @@ async def cmd_iglogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"❌ Instagram page open nahi hua: {e}")
 
 
+async def _type_slow(mgr, value: str, delay: float = 0.18) -> None:
+    """Type separately per character; RemoteApp drops bundled text payloads."""
+    for char in value:
+        await mgr.execute([("text", char)])
+        await asyncio.sleep(delay)
+
+
 async def _handle_ig_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Consume the next private-chat username/password without logging or persisting secrets."""
+    """Consume private login/OTP messages without persisting secrets."""
     if not update.message or not update.message.text or not update.effective_chat:
         return False
     chat_id = update.effective_chat.id
@@ -1685,63 +1811,94 @@ async def _handle_ig_login_message(update: Update, context: ContextTypes.DEFAULT
         ig_login_sessions.pop(chat_id, None)
         return True
 
-    if session.get("step") == "username":
+    step = session.get("step")
+    if step == "username":
         username = update.message.text.strip()
-        if not username:
-            await update.message.reply_text("Username khali hai. Dobara username bhejo, ya /cancel.")
+        if not username or username.startswith("/"):
+            await update.message.reply_text("Username bhejo, ya /cancel se flow rok do.")
             return True
         session["username"] = username
         session["step"] = "password"
-        await update.message.reply_text("Ab password bhejo. Password message ko main turant delete karne ki koshish karunga.")
+        await update.message.reply_text("Ab password bhejo. Password message delete hone ke baad hi RDP par type karunga.")
         return True
 
-    # Once submitted, accept an optional OTP only through /igotp; ordinary
-    # messages and bot commands must continue to work while awaiting a challenge.
-    if session.get("step") == "otp":
+    if step == "otp":
+        code = update.message.text.strip()
+        if code.startswith("/"):
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9-]{4,12}", code):
+            await update.message.reply_text("OTP/backup code 4–12 characters ka hona chahiye; ya /cancel karo.")
+            return True
+        try:
+            await update.message.delete()
+        except Exception:
+            await update.message.reply_text("🔒 OTP message delete nahi hua, isliye code submit nahi kiya. Chat se delete karke dobara bhejo.")
+            return True
+        try:
+            mgr = get_mgr()
+            await mgr.ensure()
+            width, height = mgr.client.width, mgr.client.height
+            await mgr.execute([
+                ("click", int(width * 0.50), int(height * 0.80), 1, False),
+                ("wait", 0.3), ("key", "ctrl+a"),
+            ])
+            await _type_slow(mgr, code, 0.25)
+            await mgr.execute([
+                ("wait", 0.4),
+                ("click", int(width * 0.50), int(height * 0.955), 1, False),
+                ("wait", 5.0),
+            ])
+            # After OTP submission, open the Direct Messages sidebar. This is a
+            # navigation click only; no chat is selected and no message is sent.
+            await _click_instagram_messages(mgr)
+            ig_login_sessions.pop(chat_id, None)
+            await update.effective_chat.send_message("✅ OTP submit hua; Instagram Messages section kholne ka click bheja. /screen se verify karo.")
+        except Exception:
+            ig_login_sessions.pop(chat_id, None)
+            log.exception("Instagram OTP flow failed")
+            await update.effective_chat.send_message("❌ OTP flow fail hua. /screen check karo; code store nahi hua.")
+        return True
+
+    if step != "password":
         return False
 
-    # Keep the password only in this local variable; don't put it in user_data,
-    # a file, a log, or a reply. Remove the session before any remote operations.
+    # Password is held only in this local variable and deleted before entering it.
     password = update.message.text
     username = session.get("username", "")
-    ig_login_sessions.pop(chat_id, None)
     try:
         await update.message.delete()
     except Exception:
         password = ""
-        await update.message.reply_text(
-            "🔒 Telegram se password message delete nahi kar paya, isliye maine login submit nahi kiya. "
-            "Chat se message khud delete karo; phir /iglogin dobara chalao."
-        )
+        await update.message.reply_text("🔒 Password message delete nahi hua, isliye login submit nahi kiya. Message khud delete karke flow dobara start karo.")
         return True
 
     try:
         mgr = get_mgr()
-        if not mgr.is_connected:
-            password = ""
-            await update.effective_chat.send_message("❌ RDP disconnected hai. /connect karke /iglogin dobara chalao.")
-            return True
+        await mgr.ensure()
         width, height = mgr.client.width, mgr.client.height
-        # Instagram's current desktop layout places the login card on the
-        # right half of the page (username around x=.75w/y=.35h); tab to
-        # password, then physically click Log in rather than relying on Enter.
         await mgr.execute([
             ("click", int(width * 0.75), int(height * 0.35), 1, False),
-            ("wait", 0.3), ("key", "ctrl+a"), ("text", username),
-            ("key", "tab"), ("text", password), ("wait", 0.4),
+            ("wait", 0.3), ("key", "ctrl+a"),
+        ])
+        await _type_slow(mgr, username)
+        await mgr.execute([("key", "tab")])
+        await _type_slow(mgr, password)
+        await mgr.execute([
+            ("wait", 0.4),
             ("click", int(width * 0.75), int(height * 0.54), 1, False),
             ("wait", 5.0),
         ])
         password = ""
         ig_login_sessions[chat_id] = {"step": "otp"}
         await update.effective_chat.send_message(
-            "✅ Login details submit kar diye. Agar Instagram OTP maange, `/igotp CODE` bhejo—code message delete karke submit karunga. "
-            "Agar OTP na aaye to /cancel bhej do. Approval/2FA prompt alag ho to /screen check karo."
+            "✅ Login form submit hua. Agar OTP maange, code ko agle message mein bhejo—delete hone ke baad submit hoga aur Messages khulega. "
+            "Agar OTP nahi aaya/already logged in ho, Open Messages button use karo; koi message send nahi hoga.",
+            reply_markup=_instagram_after_open_keyboard(),
         )
     except Exception:
         password = ""
         log.exception("Instagram login automation failed")
-        await update.effective_chat.send_message("❌ Login form fill nahi ho paya. /screen bhejo aur page check karo; secret save nahi hua.")
+        await update.effective_chat.send_message("❌ Login form fill nahi ho paya. /screen check karo; secret save nahi hua.")
     return True
 
 
@@ -1861,7 +2018,6 @@ def main() -> None:
     start_health_server()
 
     app = Application.builder().token(cfg["telegram_token"]).build()
-    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
@@ -1877,17 +2033,16 @@ def main() -> None:
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("search", cmd_search))
-    app.add_handler(CommandHandler("instagram", cmd_iglogin))
-    app.add_handler(CommandHandler("igdm", cmd_igdm))
-    app.add_handler(CommandHandler("iglogin", cmd_iglogin))
-    app.add_handler(CommandHandler("igotp", cmd_igotp))
     app.add_handler(CommandHandler("fix", cmd_fix))
     app.add_handler(CommandHandler("ui", cmd_ui))
     app.add_handler(CommandHandler("keyboard", cmd_ui))
     app.add_handler(CommandHandler("mouse", cmd_ui))
     app.add_handler(CommandHandler("ctrl", cmd_ctrl))
+    app.add_handler(CommandHandler("instagram", cmd_instagram))
+    app.add_handler(CommandHandler("igdm", cmd_igdm))
     app.add_handler(CallbackQueryHandler(on_search_callback, pattern=r"^search:"))
-    app.add_handler(CallbackQueryHandler(on_igdm_callback, pattern=r"^igdm:"))
+    app.add_handler(CallbackQueryHandler(on_igflow_callback, pattern=r"^igflow:"))
+    automa_features.register(app, sys.modules[__name__])
     app.add_handler(MessageHandler(filters.TEXT, on_message))
 
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

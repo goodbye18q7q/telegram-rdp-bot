@@ -66,7 +66,7 @@ class TestWiring(BotTestCase):
         for name in (
             "cmd_start", "cmd_add", "cmd_remove", "cmd_list", "cmd_switch", "cmd_connect",
             "cmd_cancel", "cmd_disconnect", "cmd_status", "cmd_screen", "cmd_win", "cmd_ctrl",
-            "cmd_igdm", "on_igdm_callback", "on_message",
+            "on_igflow_callback", "cmd_instagram", "cmd_igdm", "on_message",
         ):
             self.assertTrue(hasattr(bot, name), f"missing handler: {name}")
 
@@ -131,49 +131,139 @@ class TestInstagramOtp(BotTestCase):
         self.assertNotIn("123456", bot.ig_login_sessions[555].values())
 
 
-class TestInstagramDmButton(BotTestCase):
-    def test_igdm_command_sends_private_inline_button(self):
+class TestInstagramGuidedFlow(BotTestCase):
+    def test_igdm_command_offers_messages_button_without_sending_dm(self):
         update, msg = make_update("/igdm")
         update.effective_chat.type = "private"
-        bot.cfg["allowed_users"] = [111]
-
         asyncio.run(bot.cmd_igdm(update, MagicMock()))
-
         markup = msg.reply_text.await_args.kwargs["reply_markup"]
-        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igdm:open")
-        self.assertIn("koi message send nahi karta", msg.reply_text.await_args.args[0])
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igflow:messages")
+        self.assertIn("koi dm send nahi", "".join(msg.reply_text.await_args.args).lower())
 
-    def test_igdm_button_clicks_left_rail_messages_icon(self):
+    def test_instagram_command_opens_site_and_offers_guided_actions(self):
+        fake = self.use_fake()
+        fake.ensure = AsyncMock()
+        old = bot._open_url_for_profile
+        open_mock = AsyncMock(return_value="Navigated to Instagram")
+        bot._open_url_for_profile = open_mock
+        update, msg = make_update("/instagram")
+        update.effective_chat.type = "private"
+        try:
+            asyncio.run(bot.cmd_instagram(update, MagicMock()))
+        finally:
+            bot._open_url_for_profile = old
+        open_mock.assert_awaited_once_with(
+            fake, "https://www.instagram.com/", ""
+        )
+        markup = msg.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igflow:login")
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "igflow:messages")
+
+    def test_instagram_command_rejects_group_chat(self):
+        self.use_fake()
+        update, msg = make_update("/instagram")
+        update.effective_chat.type = "group"
+        asyncio.run(bot.cmd_instagram(update, MagicMock()))
+        self.assertIn("private DM", msg.reply_text.await_args.args[0])
+
+    def test_open_instagram_callback_offers_login_and_messages_for_private_chat(self):
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        fake.ensure = AsyncMock()
+        old = bot._open_url_for_profile
+        open_mock = AsyncMock(return_value="Navigated to Instagram")
+        bot._open_url_for_profile = open_mock
+        bot.cfg["allowed_users"] = [111]
+        query = MagicMock()
+        query.data = "igflow:open"
+        query.answer = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_user.id = 111
+        update.effective_chat.id = 555
+        update.effective_chat.type = "private"
+
+        try:
+            asyncio.run(bot.on_igflow_callback(update, MagicMock()))
+        finally:
+            bot._open_url_for_profile = old
+
+        markup = query.message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igflow:login")
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "igflow:messages")
+        open_mock.assert_awaited_once_with(fake, "https://www.instagram.com/", "")
+
+    def test_messages_button_clicks_left_rail_icon_only(self):
         from types import SimpleNamespace
         fake = self.use_fake()
         fake.client = SimpleNamespace(width=1366, height=768)
         fake.ensure = AsyncMock()
         bot.cfg["allowed_users"] = [111]
         query = MagicMock()
+        query.data = "igflow:messages"
         query.answer = AsyncMock()
         query.message.reply_text = AsyncMock()
         update = MagicMock()
         update.callback_query = query
         update.effective_user.id = 111
+        update.effective_chat.id = 555
         update.effective_chat.type = "private"
 
-        asyncio.run(bot.on_igdm_callback(update, MagicMock()))
+        asyncio.run(bot.on_igflow_callback(update, MagicMock()))
 
         actions = fake.execute.await_args[0][0]
         self.assertIn(("click", 40, 307, 1, False), actions)
-        self.assertIn("koi DM send nahi hua", query.message.reply_text.await_args.args[0])
+        self.assertIn("Koi DM send nahi hua", query.message.reply_text.await_args.args[0])
+
+    def test_connect_shows_open_instagram_button_for_both_rdp_types(self):
+        from types import SimpleNamespace
+        for host, port in (("103.76.214.2", 65430), ("192.0.2.10", 3389)):
+            fake = self.use_fake()
+            fake.client = SimpleNamespace(width=1366, height=768)
+            fake.connect = AsyncMock()
+            bot.profiles["rdp1"] = {"host": host, "port": port}
+            update, msg = make_update("/connect rdp1")
+            asyncio.run(bot._do_connect(update, "rdp1"))
+            markup = msg.reply_text.await_args.kwargs["reply_markup"]
+            self.assertEqual(markup.inline_keyboard[0][0].callback_data, "igflow:open")
+            self.assertTrue(fake.connect.awaited)
 
 
 class TestWebNavigation(BotTestCase):
-    def test_full_windows_rdp_uses_browser_address_bar_not_start_search(self):
+    def test_full_windows_rdp_launches_edge_then_uses_address_bar(self):
+        from types import SimpleNamespace
         fake = self.use_fake()
-        result = asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "windows-rdp"))
-        actions = fake.execute.await_args[0][0]
-        self.assertIn(("key", "ctrl+l"), actions)
+        fake.client = SimpleNamespace(width=1366, height=768)
+        old = bot._focus_edge_window
+        focus = AsyncMock(return_value=True)
+        bot._focus_edge_window = focus
+        try:
+            result = asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "windows-rdp"))
+        finally:
+            bot._focus_edge_window = old
+        focus.assert_awaited_once_with(fake)
+        actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
+        self.assertIn(("click", 409, 61, 1, False), actions)
         self.assertIn(("key", "escape"), actions)
-        self.assertNotIn(("key", "ctrl+esc"), actions)
-        self.assertEqual([a[1] for a in actions if a[0] == "text"], ["https://www.instagram.com"])
-        self.assertIn("current browser", result)
+        self.assertEqual([a[1] for a in actions if a[0] == "text"], list("https://www.instagram.com"))
+        self.assertIn("Navigated", result)
+
+    def test_tally_remoteapp_opens_chrome_then_navigates_url(self):
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        old = bot._open_browser_via_run
+        bot._open_browser_via_run = AsyncMock(return_value="Opened: chrome")
+        try:
+            asyncio.run(bot._open_url_for_profile(fake, "https://www.instagram.com", "103.76.214.2"))
+        finally:
+            bot._open_browser_via_run = old
+        bot._open_browser_via_run = old
+        calls = [a for call in fake.execute.await_args_list for a in call.args[0]]
+        self.assertIn(("click", 409, 61, 1, False), calls)
+        self.assertEqual([a[1] for a in calls if a[0] == "text"], list("https://www.instagram.com"))
 
 
 class TestProfiles(BotTestCase):
