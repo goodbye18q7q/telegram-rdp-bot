@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 
 MAX_SELECTED_GROUPS = 5
-MAX_WORKFLOW_BYTES = 1_000_000
+MAX_WORKFLOW_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)

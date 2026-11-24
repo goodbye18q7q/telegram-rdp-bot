@@ -64,12 +64,20 @@ class TestAutomaFeatureControls(unittest.TestCase):
         asyncio.run(automa_features.cmd_start(update, MagicMock(), self.bot))
         self.assertIn("/fetchgc", message.reply_text.await_args.args[0])
 
-    def test_repeat_run_is_blocked(self):
-        flow = ChatFlow(confirmed=True, workflow_name="Safe test", active_tabs=[0], run_state="running")
+    def test_repeat_start_is_not_blocked_by_previous_run_state(self):
+        play_img = Image.new("RGB", (1366, 768), "white")
+        ImageDraw.Draw(play_img).line([(756,329),(765,335),(756,341),(756,329)], fill="black", width=2)
+        flow = ChatFlow(confirmed=True, selected={1}, workflow_digest="digest",
+                        workflow_name="Repeatable workflow", active_tabs=[0], run_state="running")
         automa_features.flows[self.chat_id] = flow
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768),
+                              ensure=AsyncMock(), execute=AsyncMock(), screenshot=AsyncMock(return_value=play_img))
+        self.bot.get_mgr = MagicMock(return_value=mgr)
+        self.bot.log = MagicMock()
         update, message = update_for_message(self.chat_id)
         asyncio.run(automa_features.cmd_start(update, MagicMock(), self.bot))
-        self.assertIn("Duplicate run blocked", message.reply_text.await_args.args[0])
+        self.assertIn("Repeatable workflow", message.reply_text.await_args.args[0])
+        self.assertEqual(flow.run_completed, 1)
 
     def test_register_wires_requested_commands(self):
         from telegram.ext import CommandHandler
@@ -97,14 +105,14 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertTrue(asyncio.run(_focus_edge_window(mgr)))
         self.assertEqual(mgr.execute.await_count, 2)
 
-    def test_import_export_is_background_for_multitab_execution(self):
+    def test_workflow_settings_are_preserved_in_uploaded_json(self):
         import json
         from automa_guard import validate_automa_json
-        source = {"name": "Test", "drawflow": {"nodes": [{"label": "trigger", "data": {"type": "manual"}}]}}
-        exported = automa_features._background_export(source)
-        doc, summary = validate_automa_json(exported)
-        self.assertEqual(doc['settings']['execContext'], 'background')
-        self.assertEqual(summary.send_clicks, 0)
+        source = {"name": "Test", "settings": {"execContext": "popup", "special": True},
+                  "drawflow": {"nodes": [{"label": "loop-data", "data": {"type": "loop-data"}}]}}
+        doc, summary = validate_automa_json(json.dumps(source).encode())
+        self.assertEqual(doc["settings"], source["settings"])
+        self.assertEqual(summary.node_count, 1)
 
     def test_visible_rows_only_returns_nonblank_avatar_slots(self):
         image = self.inbox_image(2)

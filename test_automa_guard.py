@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from automa_guard import WorkflowValidationError, validate_automa_json
+from automa_guard import WorkflowValidationError, MAX_WORKFLOW_BYTES, validate_automa_json
 
 
 def sample_workflow():
@@ -9,58 +9,43 @@ def sample_workflow():
         "name": "One Greeting",
         "drawflow": {
             "nodes": [
-                {"id": "trigger", "label": "trigger", "data": {"type": "manual"}},
-                {"id": "active", "label": "active-tab", "data": {}},
-                {"id": "fill", "label": "forms", "data": {"type": "text-field", "value": "Hello"}},
-                {"id": "send", "label": "event-click", "data": {
-                    "selector": "button[aria-label=\"Send\"]", "multiple": False,
-                    "onError": {"retry": False, "retryTimes": 1},
+                {"id": "trigger", "label": "trigger", "data": {"type": "interval"}},
+                {"id": "loop", "label": "loop-data", "data": {"type": "loop-data"}},
+                {"id": "script", "label": "javascript", "data": {"code": "return true"}},
+                {"id": "send1", "label": "event-click", "data": {
+                    "selector": "button[aria-label=\"Send\"]", "multiple": True,
+                    "onError": {"retry": True, "retryTimes": 10},
                 }},
+                {"id": "send2", "label": "event-click", "data": {"selector": "button.submit"}},
             ]
         },
-        "settings": {"execContext": "popup"},
+        "settings": {"execContext": "popup", "custom": True},
     }
 
 
 class TestAutomaGuard(unittest.TestCase):
-    def test_accepts_one_manual_send_sample(self):
-        doc, summary = validate_automa_json(json.dumps(sample_workflow()).encode())
+    def test_accepts_repeat_script_schedule_multiple_sends_and_retries(self):
+        source = sample_workflow()
+        raw = json.dumps(source).encode()
+        doc, summary = validate_automa_json(raw)
         self.assertEqual(summary.name, "One Greeting")
-        self.assertEqual(summary.send_clicks, 1)
-        self.assertEqual(summary.node_count, 4)
-        self.assertEqual(doc["settings"]["execContext"], "popup")
+        self.assertEqual(summary.node_count, 5)
+        self.assertEqual(summary.send_clicks, 2)
+        self.assertEqual(doc, source)
 
-    def test_rejects_loop_blocks(self):
-        doc = sample_workflow()
-        doc["drawflow"]["nodes"].append({"label": "loop-data", "data": {"type": "loop-data"}})
-        with self.assertRaisesRegex(WorkflowValidationError, "not allowed"):
-            validate_automa_json(json.dumps(doc).encode())
+    def test_accepts_workflow_without_active_tab_or_node_list(self):
+        source = {"name": "Other workflow format", "settings": {"execContext": "popup"}}
+        doc, summary = validate_automa_json(json.dumps(source).encode())
+        self.assertEqual(doc, source)
+        self.assertEqual(summary.node_count, 0)
 
-    def test_rejects_nonmanual_trigger(self):
-        doc = sample_workflow()
-        doc["drawflow"]["nodes"][0]["data"]["type"] = "interval"
-        with self.assertRaises(WorkflowValidationError):
-            validate_automa_json(json.dumps(doc).encode())
-
-    def test_rejects_multiple_send_clicks(self):
-        doc = sample_workflow()
-        clone = json.loads(json.dumps(doc["drawflow"]["nodes"][-1]))
-        clone["id"] = "click-send-twice"
-        doc["drawflow"]["nodes"].append(clone)
-        with self.assertRaisesRegex(WorkflowValidationError, "At most one"):
-            validate_automa_json(json.dumps(doc).encode())
-
-    def test_rejects_retried_send_click(self):
-        doc = sample_workflow()
-        doc["drawflow"]["nodes"][-1]["data"]["onError"]["retry"] = True
-        with self.assertRaisesRegex(WorkflowValidationError, "cannot retry"):
-            validate_automa_json(json.dumps(doc).encode())
-
-    def test_rejects_non_json_and_oversize(self):
-        with self.assertRaises(WorkflowValidationError):
+    def test_rejects_invalid_json_non_object_and_oversize_only(self):
+        with self.assertRaisesRegex(WorkflowValidationError, "valid UTF-8 JSON"):
             validate_automa_json(b"not json")
-        with self.assertRaisesRegex(WorkflowValidationError, "1 MB"):
-            validate_automa_json(b" " * 1_000_001)
+        with self.assertRaisesRegex(WorkflowValidationError, "root must be an object"):
+            validate_automa_json(json.dumps([1, 2, 3]).encode())
+        with self.assertRaisesRegex(WorkflowValidationError, "20 MB"):
+            validate_automa_json(b" " * (MAX_WORKFLOW_BYTES + 1))
 
 
 if __name__ == "__main__":

@@ -1,14 +1,13 @@
 """Telegram commands for selecting Instagram inbox chats and controlling Automa.
 
-State is private-chat scoped. Workflows are validated and imported but never run
-on upload. /start runs once per selected tab with a duplicate-action guard.
+Workflow JSON is syntax-checked but its settings and block types are preserved.
+Uploading imports only; execution happens through /start.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import io
-import json
 import os
 import re
 from typing import Any
@@ -189,7 +188,7 @@ async def cmd_setautoma(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
         flow = flows.setdefault(update.effective_chat.id, ChatFlow())
         flow.profile = bot.mgr_key()
         context.user_data["automa_upload_pending"] = True
-        await update.message.reply_text("Automa dashboard khol diya. Ab exported .json workflow isi private chat mein document bana kar bhejo. Validate/import hoga; upload se workflow run nahi hoga.")
+        await update.message.reply_text("Automa dashboard khol diya. Ab apna exported .json workflow isi private chat mein document bana kar bhejo. Workflow import hoga; upload par run nahi hoga.")
     except Exception as exc:
         bot.log.exception("/setautoma failed")
         await update.message.reply_text(f"❌ Automa dashboard nahi khula: {exc}")
@@ -197,20 +196,6 @@ async def cmd_setautoma(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
 
 def _base_url() -> str:
     return (os.environ.get("AUTOMA_DOWNLOAD_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://telegram-rdp-bot.onrender.com").rstrip("/")
-
-
-def _background_export(doc: dict[str, Any]) -> bytes:
-    """Use background execution so tab switching does not close a running popup.
-
-    Automa background runs have a ~5 minute limit and fewer JS/clipboard features;
-    see the confirmation message before the workflow is started.
-    """
-    settings = doc.get("settings")
-    if not isinstance(settings, dict):
-        settings = {}
-        doc["settings"] = settings
-    settings["execContext"] = "background"
-    return json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def get_download(token: str):
@@ -254,8 +239,8 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     doc_file = update.message.document
     filename = doc_file.file_name or "workflow.json"
-    if not filename.lower().endswith(".json") or (doc_file.file_size and doc_file.file_size > 1_000_000):
-        await update.message.reply_text("Sirf 1 MB tak ki .json file bhejo.")
+    if not filename.lower().endswith(".json") or (doc_file.file_size and doc_file.file_size > 20 * 1024 * 1024):
+        await update.message.reply_text("Sirf 20 MB tak ki .json workflow file bhejo.")
         return
     try:
         tgfile = await context.bot.get_file(doc_file.file_id)
@@ -268,8 +253,8 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
         bot.log.exception("workflow document validation failed")
         await update.message.reply_text(f"❌ JSON read/validate nahi hua: {exc}")
         return
-    raw = _background_export(parsed)
-    parsed, summary = validate_automa_json(raw)
+    # Preserve the uploaded workflow exactly: do not force background execution,
+    # rewrite settings, or filter node/block types.
     flow = flows.setdefault(update.effective_chat.id, ChatFlow())
     digest = hashlib.sha256(raw).hexdigest()
     if flow.workflow_digest != digest:
@@ -280,13 +265,6 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
     flow.workflow_bytes = raw
     flow.send_clicks = summary.send_clicks
     flow.profile = flow.profile or bot.mgr_key()
-    labels = [str(node.get("label", "")).lower() for node in parsed.get("drawflow", {}).get("nodes", [])]
-    if "active-tab" not in labels:
-        await update.message.reply_text("Workflow mein Active Tab block nahi hai; selected Instagram chat tabs ko target nahi kar sakta. Import cancel kiya.")
-        flow.workflow_name = None; flow.workflow_bytes = None
-        context.user_data["automa_upload_pending"] = False
-        return
-
     token = vault.put(filename, raw)
     safe_name = f"automa-{token[:8]}.json"
     _download_names[token] = safe_name
@@ -309,7 +287,7 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["automa_upload_pending"] = False
         image = await mgr.screenshot()
         buf = io.BytesIO(); image.save(buf, format="PNG"); buf.seek(0)
-        await update.message.reply_photo(photo=buf, caption=f"Import sequence finished for ‘{summary.name}’ ({summary.node_count} blocks; {summary.send_clicks} possible Send click(s)). Execution set to background for multi-tab runs (Automa limit ~5 min). Verify it is listed in Automa. Not run.")
+        await update.message.reply_photo(photo=buf, caption=f"Import sequence finished for ‘{summary.name}’ ({summary.node_count} blocks detected). Original workflow settings and blocks preserved; it was not run. Verify it is listed in Automa.")
     except Exception as exc:
         vault.discard(token); _download_names.pop(token, None)
         bot.log.exception("Automa import UI failed")
@@ -324,19 +302,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> 
     if not flow.workflow_name:
         await update.message.reply_text("Pehle /setautoma se workflow import karo.")
         return
-    if flow.run_state is not None:
-        await update.message.reply_text(f"Is workflow ke liye run state ‘{flow.run_state}’ hai. Duplicate run blocked.")
-        return
-    if any(key in flow.completed_targets for key in _target_keys(flow)):
-        await update.message.reply_text("Selected group(s) par yeh workflow pehle attempt ho chuka hai; repeat send/action blocked.")
-        return
     try:
         count = await _run_flow_once_per_tab(flow, bot)
         await update.message.reply_text(f"Run clicks bheje: ‘{flow.workflow_name}’ ek baar per selected tab ({count}). /stop se rukao; /screen se status verify karo.")
     except Exception as exc:
         flow.run_state = "partial"
         bot.log.exception("/start Automa run failed")
-        await update.message.reply_text(f"❌ Run beech mein fail hua ({flow.run_completed}/{len(flow.active_tabs)} tabs attempted). Duplicate run blocked; /stop use karo. Error: {exc}")
+        await update.message.reply_text(f"❌ Run beech mein fail hua ({flow.run_completed}/{len(flow.active_tabs)} tabs attempted). Status /screen se verify karo. Error: {exc}")
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
