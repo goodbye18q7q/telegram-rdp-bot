@@ -110,6 +110,27 @@ class TestAutomaFeatureControls(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_auto_refresh_retries_after_transient_rdp_error(self):
+        async def run():
+            flow = ChatFlow(run_state="running", active_tabs=[0], profile="rdp1")
+            failed_mgr = SimpleNamespace(ensure=AsyncMock(side_effect=RuntimeError("temporary RDP error")),
+                                        execute=AsyncMock())
+            working_mgr = SimpleNamespace(ensure=AsyncMock(), execute=AsyncMock())
+            bot = SimpleNamespace(get_mgr=MagicMock(side_effect=[failed_mgr, working_mgr]),
+                                  log=MagicMock())
+            async def sent(**kwargs):
+                if "Ctrl+R sent" in kwargs.get("text", ""):
+                    flow.run_state = "stopped"
+            telegram_bot = SimpleNamespace(send_message=AsyncMock(side_effect=sent))
+            with unittest.mock.patch.object(automa_features, "AUTO_REFRESH_SECONDS", 0.005):
+                await automa_features._auto_refresh_tabs(self.chat_id, flow, bot, telegram_bot)
+            failed_mgr.execute.assert_not_awaited()
+            working_mgr.execute.assert_awaited_once()
+            self.assertTrue(any("will retry in 5 minutes" in c.kwargs.get("text", "")
+                                for c in telegram_bot.send_message.await_args_list))
+
+        asyncio.run(run())
+
     def test_start_requires_selected_groups_and_prepared_tabs(self):
         automa_features.flows[self.chat_id] = ChatFlow(workflow_name="Safe test")
         update, message = update_for_message(self.chat_id)

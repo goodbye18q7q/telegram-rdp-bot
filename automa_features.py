@@ -11,6 +11,7 @@ import hashlib
 import io
 import os
 import re
+import time
 from typing import Any
 
 from PIL import Image
@@ -402,31 +403,39 @@ async def _cancel_auto_refresh(chat_id: int) -> None:
 async def _auto_refresh_tabs(chat_id: int, flow: ChatFlow, bot, telegram_bot) -> None:
     """Send Ctrl+R to the currently focused remote tab every five minutes."""
     this_task = asyncio.current_task()
+    last_error_notice = 0.0
     try:
         while flow.run_state == "running":
             await asyncio.sleep(AUTO_REFRESH_SECONDS)
             if flow.run_state != "running":
                 break
-            mgr = bot.get_mgr(flow.profile)
-            await mgr.ensure()
-            # User explicitly asked to refresh whichever remote browser tab is
-            # currently focused. Do not switch tabs or fail on screenshot focus
-            # heuristics; Ctrl+R goes to the active remote window/tab as-is.
-            await mgr.execute([("key", "ctrl+r"), ("wait", 6.0)])
-            if flow.run_state == "running":
-                await telegram_bot.send_message(
-                    chat_id=chat_id,
-                    text="🔄 5-minute auto-refresh: Ctrl+R sent to the currently focused remote tab. It may interrupt the active workflow or restart a page-load trigger; use /stop to end auto-refresh.",
-                )
+            try:
+                mgr = bot.get_mgr(flow.profile)
+                await mgr.ensure()
+                # User explicitly asked to refresh whichever remote browser tab is
+                # currently focused. Do not switch tabs or fail on screenshot focus
+                # heuristics; Ctrl+R goes to the active remote window/tab as-is.
+                await mgr.execute([("key", "ctrl+r"), ("wait", 6.0)])
+                if flow.run_state == "running":
+                    await telegram_bot.send_message(
+                        chat_id=chat_id,
+                        text="🔄 5-minute auto-refresh: Ctrl+R sent to the currently focused remote tab. It may interrupt the active workflow or restart a page-load trigger; use /stop to end auto-refresh.",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                bot.log.exception("five-minute workflow tab refresh attempt failed; will retry next interval")
+                # A transient RDP/API hiccup should not permanently kill the
+                # periodic task. Avoid sending a warning every five minutes.
+                if time.monotonic() - last_error_notice >= 1800:
+                    last_error_notice = time.monotonic()
+                    with contextlib.suppress(Exception):
+                        await telegram_bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ Scheduled refresh failed this time; it will retry in 5 minutes. Check /screen. Error: {exc}",
+                        )
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        bot.log.exception("five-minute workflow tab refresh failed")
-        with contextlib.suppress(Exception):
-            await telegram_bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Scheduled tab refresh failed; no further auto-refresh will run. Check /screen. Error: {exc}",
-            )
     finally:
         if _auto_refresh_tasks.get(chat_id) is this_task:
             _auto_refresh_tasks.pop(chat_id, None)
