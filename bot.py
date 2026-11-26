@@ -80,6 +80,7 @@ HELP_TEXT = """🤖 RDP Control Bot — multi profile
 /remove RDP1                  — delete a profile
 /disconnect                   — close the active connection
 /status                       — active profile + connection status
+/keepalive                    — send one small pointer nudge now; automatic idle keepalive is already on
 /cancel                       — cancel the connect flow
 /screen                       — photo of the active desktop
 /fix                          — black screen fix (disconnect + reconnect)
@@ -767,7 +768,7 @@ async def _do_connect(update: Update, name: str | None = None) -> None:
             "Edge taskbar se open/focus confirm nahi hua; /screen check karo."
         )
         await update.message.reply_text(
-            f"✅ Connected: {key} — {host}:{port}\n{edge_status}\n🛡 RDP keepalive on: idle mein har 2 minute current pointer par no-click move. Instagram ke liye button dabao.",
+            f"✅ Connected: {key} — {host}:{port}\n{edge_status}\n🛡 RDP keepalive on: 2 minute idle hone par cursor 1px nudge karke wapas aayega (no click/key). /keepalive se ek nudge abhi bhejo. Instagram ke liye button dabao.",
             reply_markup=open_instagram,
         )
     except Exception as e:
@@ -997,6 +998,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"👉 Active: {mgr_key()} — {current['host']}:{current['port']} ({current['user']}) {state}{keepalive}"
     )
+
+
+@guarded
+async def cmd_keepalive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send an immediate one-pixel cursor nudge; automatic idle nudges continue."""
+    try:
+        mgr = get_mgr()
+        await mgr.keepalive_now()
+        await update.message.reply_text(
+            "🛡 RDP keepalive nudge bheja: cursor 1px gaya aur wapas aaya; click/keypress nahi hua. "
+            "Connected session par automatic idle nudges bhi active hain."
+        )
+    except Exception as exc:
+        log.exception("manual RDP keepalive failed")
+        await update.message.reply_text(f"❌ RDP keepalive nahi bhej paya: {exc}")
 
 
 @guarded
@@ -2199,6 +2215,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("keepalive", cmd_keepalive))
     app.add_handler(CommandHandler("screen", cmd_screen))
     app.add_handler(CommandHandler("win", cmd_win))
     app.add_handler(CommandHandler("run", cmd_run))

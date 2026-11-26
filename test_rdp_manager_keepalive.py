@@ -36,7 +36,7 @@ class TestRdpKeepalive(unittest.TestCase):
         if hasattr(rdp_manager.socket, "TCP_KEEPIDLE"):
             self.assertIn((rdp_manager.socket.IPPROTO_TCP, rdp_manager.socket.TCP_KEEPIDLE, 60), client.sock.options)
 
-    def test_idle_keepalive_moves_at_current_position_without_click_or_key(self):
+    def test_idle_keepalive_nudges_one_pixel_and_returns_without_click_or_key(self):
         async def run():
             mgr = rdp_manager.RDPManager({"rdp_host": "host", "rdp_port": 3389,
                                           "rdp_idle_keepalive_seconds": 1})
@@ -45,13 +45,15 @@ class TestRdpKeepalive(unittest.TestCase):
             mgr._last_input_at = time.monotonic() - 10
             with patch.object(rdp_manager, "KEEPALIVE_CHECK_SECONDS", 0.005):
                 task = asyncio.create_task(mgr._idle_keepalive_loop())
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.08)
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-            client.mouse_move.assert_awaited_with(123, 456)
+            self.assertEqual(client.mouse_move.await_args_list[0].args, (124, 456))
+            self.assertEqual(client.mouse_move.await_args_list[1].args, (123, 456))
+            self.assertEqual(client.mouse_move.await_count, 2)
             self.assertIsNone(mgr._keepalive_task)
 
         asyncio.run(run())

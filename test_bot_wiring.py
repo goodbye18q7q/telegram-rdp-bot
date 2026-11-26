@@ -65,7 +65,7 @@ class TestWiring(BotTestCase):
         # main() jo handlers register karta hai, sab exist karne chahiye
         for name in (
             "cmd_start", "cmd_add", "cmd_remove", "cmd_list", "cmd_switch", "cmd_connect",
-            "cmd_cancel", "cmd_disconnect", "cmd_status", "cmd_screen", "cmd_win", "cmd_ctrl",
+            "cmd_cancel", "cmd_disconnect", "cmd_status", "cmd_keepalive", "cmd_screen", "cmd_win", "cmd_ctrl",
             "cmd_minimize", "cmd_maximize", "cmd_close", "cmd_split",
             "on_igflow_callback", "cmd_instagram", "cmd_igdm", "on_message",
         ):
@@ -268,6 +268,14 @@ class TestInstagramGuidedFlow(BotTestCase):
 
 
 class TestWebNavigation(BotTestCase):
+    def test_keepalive_command_sends_one_nudge(self):
+        fake = self.use_fake()
+        fake.keepalive_now = AsyncMock()
+        update, msg = make_update("/keepalive")
+        asyncio.run(bot.cmd_keepalive(update, MagicMock()))
+        fake.keepalive_now.assert_awaited_once()
+        self.assertIn("keepalive nudge bheja", msg.reply_text.await_args.args[0])
+
     def test_focus_does_not_click_active_taskbar_button(self):
         from PIL import Image, ImageDraw
         from types import SimpleNamespace

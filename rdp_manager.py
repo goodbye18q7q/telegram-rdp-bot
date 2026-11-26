@@ -165,12 +165,33 @@ class RDPManager:
         log.warning("Screen %ss me ready nahi hua", timeout)
         return False
 
+    async def _send_pointer_nudge(self, client) -> None:
+        """Move the pointer one pixel and return it, with no click or keystroke."""
+        pointer = getattr(getattr(client, "_display", None), "pointer_position", None)
+        if pointer is None:
+            pointer = (client.width // 2, client.height // 2)
+        x, y = int(pointer[0]), int(pointer[1])
+        next_x = x + 1 if x < client.width - 1 else max(0, x - 1)
+        await client.mouse_move(next_x, y)
+        await asyncio.sleep(0.05)
+        await client.mouse_move(x, y)
+        self._last_input_at = time.monotonic()
+        log.debug("Sent RDP keepalive pointer nudge %s -> (%d,%d) -> %s", pointer, next_x, y, pointer)
+
+    async def keepalive_now(self) -> None:
+        """Send one manual keepalive nudge immediately."""
+        await self.ensure()
+        async with self._exec_lock:
+            if not self.client or not self.client.is_connected:
+                raise ConnectionError("RDP is not connected")
+            await self._send_pointer_nudge(self.client)
+
     async def _idle_keepalive_loop(self) -> None:
         """Keep idle Windows sessions active without clicks or keystrokes.
 
-        Only after the controller has been idle for the configured interval, send
-        a mouse-move event to the *current* pointer coordinates. It does not move
-        the pointer to a new location, click, type, or change browser focus.
+        After the controller has been idle for the configured interval, move the
+        pointer one pixel and return it to its previous position. This real but
+        tiny mouse movement is intended to reset Windows' idle-input timer.
         """
         this_task = asyncio.current_task()
         try:
@@ -187,12 +208,7 @@ class RDPManager:
                             time.monotonic() - self._last_input_at < interval):
                         continue
                     try:
-                        pointer = getattr(getattr(client, "_display", None), "pointer_position", None)
-                        if pointer is None:
-                            pointer = (client.width // 2, client.height // 2)
-                        await client.mouse_move(int(pointer[0]), int(pointer[1]))
-                        self._last_input_at = time.monotonic()
-                        log.debug("Sent idle RDP keepalive at current pointer position %s", pointer)
+                        await self._send_pointer_nudge(client)
                     except Exception:
                         log.exception("Idle RDP input keepalive failed")
         except asyncio.CancelledError:
