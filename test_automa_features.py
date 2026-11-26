@@ -92,7 +92,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertIn(("click", 1044, row_y, 1, False), clicks)
         self.assertIn("Saved workflow 3", message.reply_text.await_args.args[0])
 
-    def test_auto_refresh_reloads_each_active_tab_then_notifies(self):
+    def test_auto_refresh_reloads_only_the_focused_tab_without_focus_probe(self):
         async def run():
             flow = ChatFlow(run_state="running", active_tabs=[0, 1], profile="rdp1")
             mgr = SimpleNamespace(ensure=AsyncMock(), execute=AsyncMock())
@@ -104,7 +104,8 @@ class TestAutomaFeatureControls(unittest.TestCase):
             with unittest.mock.patch.object(automa_features, "AUTO_REFRESH_SECONDS", 0.005):
                 await automa_features._auto_refresh_tabs(self.chat_id, flow, bot, telegram_bot)
             actions = [action for call in mgr.execute.await_args_list for action in call.args[0]]
-            self.assertEqual(sum(action == ("key", "ctrl+r") for action in actions), 2)
+            self.assertEqual(sum(action == ("key", "ctrl+r") for action in actions), 1)
+            bot._focus_edge_window.assert_not_awaited()
             self.assertIn("may interrupt", telegram_bot.send_message.await_args.kwargs["text"])
 
         asyncio.run(run())

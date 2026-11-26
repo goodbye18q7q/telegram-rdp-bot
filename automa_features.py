@@ -400,7 +400,7 @@ async def _cancel_auto_refresh(chat_id: int) -> None:
 
 
 async def _auto_refresh_tabs(chat_id: int, flow: ChatFlow, bot, telegram_bot) -> None:
-    """Reload each prepared tab every five minutes while the user-selected run is tracked."""
+    """Send Ctrl+R to the currently focused remote tab every five minutes."""
     this_task = asyncio.current_task()
     try:
         while flow.run_state == "running":
@@ -409,20 +409,14 @@ async def _auto_refresh_tabs(chat_id: int, flow: ChatFlow, bot, telegram_bot) ->
                 break
             mgr = bot.get_mgr(flow.profile)
             await mgr.ensure()
-            if not await bot._focus_edge_window(mgr):
-                raise RuntimeError("Browser focus could not be verified; skipped the scheduled reload")
-            await _maximize_edge(mgr)
-            tab_count = len(flow.active_tabs)
-            for position in range(tab_count):
-                if flow.run_state != "running":
-                    break
-                await mgr.execute([("key", "ctrl+r"), ("wait", 6.0)])
-                if position < tab_count - 1:
-                    await mgr.execute([("key", "ctrl+shift+tab"), ("wait", 0.5)])
+            # User explicitly asked to refresh whichever remote browser tab is
+            # currently focused. Do not switch tabs or fail on screenshot focus
+            # heuristics; Ctrl+R goes to the active remote window/tab as-is.
+            await mgr.execute([("key", "ctrl+r"), ("wait", 6.0)])
             if flow.run_state == "running":
                 await telegram_bot.send_message(
                     chat_id=chat_id,
-                    text=f"🔄 5-minute auto-refresh: {tab_count} workflow tab(s) reloaded. Reload may interrupt a running flow or cause a configured page-load trigger to run again; use /stop to end auto-refresh.",
+                    text="🔄 5-minute auto-refresh: Ctrl+R sent to the currently focused remote tab. It may interrupt the active workflow or restart a page-load trigger; use /stop to end auto-refresh.",
                 )
     except asyncio.CancelledError:
         raise
@@ -456,7 +450,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> 
         )
         await update.message.reply_text(
             f"Run clicks bheje: ‘{label}’ selected tab(s) par ({count}). Workflow loops as-is chalenge. "
-            "Har 5 minute selected tab(s) reload honge; isse active run ruk sakta hai ya page-load trigger dobara chal sakta hai. "
+            "Har 5 minute currently focused remote tab par Ctrl+R bheja jayega; isse active run ruk sakta hai ya page-load trigger dobara chal sakta hai. "
             "/stop se workflow aur auto-refresh dono rokne ki koshish karo; /screen se verify karo."
         )
     except Exception as exc:
