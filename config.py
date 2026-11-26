@@ -41,6 +41,9 @@ def load_config() -> dict:
         "rdp_height": _int("RDP_HEIGHT", 768),
         "rdp_color_depth": _int("RDP_COLOR_DEPTH", 32),
         "capture_fps": _int("CAPTURE_FPS", 5),
+        # Send a no-op mouse move at the current pointer location while the
+        # Windows desktop is idle; set 0 to disable input keepalive.
+        "rdp_idle_keepalive_seconds": _int("RDP_IDLE_KEEPALIVE_SECONDS", 120),
         # Typing speed (chars/sec)
         "type_cps": _float("TYPE_CPS", 12.0),
     }

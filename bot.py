@@ -767,7 +767,7 @@ async def _do_connect(update: Update, name: str | None = None) -> None:
             "Edge taskbar se open/focus confirm nahi hua; /screen check karo."
         )
         await update.message.reply_text(
-            f"✅ Connected: {key} — {host}:{port}\n{edge_status} Instagram ke liye button dabao.",
+            f"✅ Connected: {key} — {host}:{port}\n{edge_status}\n🛡 RDP keepalive on: idle mein har 2 minute current pointer par no-click move. Instagram ke liye button dabao.",
             reply_markup=open_instagram,
         )
     except Exception as e:
@@ -993,8 +993,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     mgr = managers.get(mgr_key())
     state = "🟢 connected" if (mgr and mgr.is_connected) else "🔴 disconnected"
+    keepalive = " | 🛡 keepalive active" if mgr and mgr.keepalive_active else ""
     await update.message.reply_text(
-        f"👉 Active: {mgr_key()} — {current['host']}:{current['port']} ({current['user']}) {state}"
+        f"👉 Active: {mgr_key()} — {current['host']}:{current['port']} ({current['user']}) {state}{keepalive}"
     )
 
 

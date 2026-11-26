@@ -71,7 +71,10 @@ after 15 minutes of inactivity.
 | `ALLOWED_USERS` | Only these Telegram IDs may control the bot (comma separated). Empty = allow everyone ⚠️ |
 | `RDP_WIDTH` / `RDP_HEIGHT` | Screen size — default 1366×768 |
 | `CAPTURE_FPS` | Screen capture rate — default 5 (keeps CPU low) |
+| `RDP_IDLE_KEEPALIVE_SECONDS` | While idle, send a no-click mouse-move at the current pointer every N seconds — default 120; set `0` to disable |
 | `TYPE_CPS` | Typing speed (chars/sec) — default 12 |
+
+The RDP manager also enables OS TCP keepalive probes on the RDP socket. Idle input keepalive sends no clicks or keys and targets the current pointer position to reduce the chance of Windows idle-session timeout. It cannot override a server-enforced maximum session duration, logoff policy, reboot, or a Render process restart.
 
 ## 💻 Run locally (testing)
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
+import time
 
 from simple_rdp import RDPClient
 
@@ -25,6 +27,25 @@ CONNECT_ATTEMPTS = 3
 # Server Demand Active ke baad pehla screen kuch seconds late bhejta hai.
 # Jab tak bitmap updates na aayein, screenshot black dikhta hai.
 SCREEN_WAIT_TIMEOUT = 30.0
+KEEPALIVE_CHECK_SECONDS = 15.0
+
+
+def _enable_tcp_keepalive(client) -> bool:
+    """Ask the OS to probe an otherwise-idle RDP TCP socket for dead peers."""
+    writer = getattr(client, "_tcp_writer", None)
+    sock = writer.get_extra_info("socket") if writer else None
+    if sock is None:
+        return False
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for option_name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            option = getattr(socket, option_name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        return True
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        log.warning("Could not configure RDP TCP keepalive: %s", exc)
+        return False
 
 
 class RDPManager:
@@ -32,10 +53,17 @@ class RDPManager:
         self.cfg = cfg
         self.client: RDPClient | None = None
         self._exec_lock = asyncio.Lock()
+        self._keepalive_task: asyncio.Task | None = None
+        self._last_input_at = time.monotonic()
+        self._idle_keepalive_seconds = max(0, int(cfg.get("rdp_idle_keepalive_seconds", 120)))
 
     @property
     def is_connected(self) -> bool:
         return bool(self.client and self.client.is_connected)
+
+    @property
+    def keepalive_active(self) -> bool:
+        return bool(self.is_connected and self._keepalive_task and not self._keepalive_task.done())
 
     async def connect(self) -> None:
         if self.is_connected:
@@ -91,8 +119,17 @@ class RDPManager:
             raise last  # type: ignore[misc]
 
         self.client = client
-        log.info("RDP connected: %s:%s", cfg["rdp_host"], cfg["rdp_port"])
+        tcp_keepalive = _enable_tcp_keepalive(client)
+        self._last_input_at = time.monotonic()
+        log.info(
+            "RDP connected: %s:%s (TCP keepalive=%s, idle input keepalive=%ss)",
+            cfg["rdp_host"], cfg["rdp_port"], tcp_keepalive, self._idle_keepalive_seconds,
+        )
         await self.wait_for_screen()
+        if self._idle_keepalive_seconds and not (
+            self._keepalive_task and not self._keepalive_task.done()
+        ):
+            self._keepalive_task = asyncio.create_task(self._idle_keepalive_loop())
 
     async def wait_for_screen(
         self, timeout: float | None = None, min_mean: float = 3.0, min_painted: float = 0.85
@@ -128,7 +165,48 @@ class RDPManager:
         log.warning("Screen %ss me ready nahi hua", timeout)
         return False
 
+    async def _idle_keepalive_loop(self) -> None:
+        """Keep idle Windows sessions active without clicks or keystrokes.
+
+        Only after the controller has been idle for the configured interval, send
+        a mouse-move event to the *current* pointer coordinates. It does not move
+        the pointer to a new location, click, type, or change browser focus.
+        """
+        this_task = asyncio.current_task()
+        try:
+            while self.is_connected:
+                await asyncio.sleep(KEEPALIVE_CHECK_SECONDS)
+                if not self.is_connected:
+                    break
+                interval = self._idle_keepalive_seconds
+                if not interval or time.monotonic() - self._last_input_at < interval:
+                    continue
+                async with self._exec_lock:
+                    client = self.client
+                    if (not client or not client.is_connected or
+                            time.monotonic() - self._last_input_at < interval):
+                        continue
+                    try:
+                        pointer = getattr(getattr(client, "_display", None), "pointer_position", None)
+                        if pointer is None:
+                            pointer = (client.width // 2, client.height // 2)
+                        await client.mouse_move(int(pointer[0]), int(pointer[1]))
+                        self._last_input_at = time.monotonic()
+                        log.debug("Sent idle RDP keepalive at current pointer position %s", pointer)
+                    except Exception:
+                        log.exception("Idle RDP input keepalive failed")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._keepalive_task is this_task:
+                self._keepalive_task = None
+
     async def disconnect(self) -> None:
+        task, self._keepalive_task = self._keepalive_task, None
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         client, self.client = self.client, None
         if client is not None:
             with contextlib.suppress(Exception):
@@ -145,6 +223,8 @@ class RDPManager:
         async with self._exec_lock:
             for action in actions:
                 await apply_action(self.client, action, self.cfg)
+                if action and action[0] != "wait":
+                    self._last_input_at = time.monotonic()
 
     async def screenshot(self):
         """Remote desktop ki current photo (PIL Image)."""
