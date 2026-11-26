@@ -301,9 +301,10 @@ REMOTEAPP_HOSTS = {"103.76.214.2", "202.140.136.146"}
 
 
 def _is_remoteapp(mgr, host: str | None = None) -> bool:
-    host = host or mgr.cfg.get("rdp_host", "")
+    cfg = getattr(mgr, "cfg", {}) or {}
+    host = host or cfg.get("rdp_host", "")
     try:
-        port = int(mgr.cfg.get("rdp_port", 3389))
+        port = int(cfg.get("rdp_port", 3389))
     except (TypeError, ValueError):
         port = 3389
     return host in REMOTEAPP_HOSTS or port in REMOTEAPP_PORTS
@@ -357,12 +358,16 @@ async def _focus_edge_window(mgr) -> bool:
         await _maximize_foreground_window(mgr)
         return _looks_like_edge_window(await mgr.screenshot_nowait())
 
-    x, y = int(width * 0.341), int(height * 0.974)
-    for actions in (
+    attempts = [
         [("key", "alt+tab"), ("wait", 0.7)],
         [("key", "alt+tab"), ("wait", 0.7)],
-        [("click", x, y, 1, False), ("wait", 1.0)],
-    ):
+    ]
+    # RemoteApp sessions do not expose the normal Windows taskbar layout, so
+    # never click the old desktop's pinned-browser coordinates there.
+    if not _is_remoteapp(mgr):
+        x, y = int(width * 0.341), int(height * 0.974)
+        attempts.append([("click", x, y, 1, False), ("wait", 1.0)])
+    for actions in attempts:
         await mgr.execute(actions)
         await _maximize_foreground_window(mgr)
         if _looks_like_edge_window(await mgr.screenshot_nowait()):
@@ -371,14 +376,14 @@ async def _focus_edge_window(mgr) -> bool:
 
 
 async def _navigate_browser_addressbar(mgr, url: str) -> None:
-    """Navigate the foreground browser, typing slowly for RemoteApp reliability."""
+    """Navigate the foreground browser without layout-specific coordinate clicks."""
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
-    width, height = mgr.client.width, mgr.client.height
+    # Ctrl+L targets the browser address bar across Chrome/Edge layouts and
+    # resolutions; a fixed click near the old toolbar/search field is brittle.
     await mgr.execute([
         ("key", "escape"), ("wait", 0.2),
-        ("click", int(width * 0.30), int(height * 0.08), 1, False),
-        ("key", "ctrl+a"), ("key", "backspace"),
+        ("key", "ctrl+l"), ("key", "ctrl+a"), ("key", "backspace"),
     ])
     for char in url:
         await mgr.execute([("text", char)])
@@ -1636,14 +1641,11 @@ def _instagram_after_open_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def _click_instagram_messages(mgr) -> None:
-    width, height = mgr.client.width, mgr.client.height
-    # On the current Edge desktop layout, the paper-plane Messages icon is
-    # centered around x=40,y=307. The earlier y=339 coordinate hit Search.
-    await mgr.execute([
-        ("click", int(width * 40 / 1366), int(height * 307 / 768), 1, False),
-        ("wait", 2.0),
-    ])
+async def _open_instagram_messages(mgr) -> str | None:
+    """Open Instagram inbox directly, avoiding UI-version-specific icon clicks."""
+    return await _open_url_for_profile(
+        mgr, "https://www.instagram.com/direct/inbox/", current.get("host", "")
+    )
 
 
 @guarded
@@ -1724,12 +1726,18 @@ async def on_igflow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Username bhejo. Is private chat mein username ke baad password maangunga; password message delete hone ke baad hi RDP par type hoga."
             )
         elif action == "messages":
-            await _click_instagram_messages(mgr)
+            res = await _open_instagram_messages(mgr)
+            if not res or "Not found" in res:
+                await query.message.reply_text(
+                    "❌ Instagram inbox route open confirm nahi hua. /screen se browser state check karo."
+                )
+                return
             ig_login_sessions.pop(chat_id, None)
             await query.message.reply_text(
-                "✅ Instagram Messages khola. Koi DM send nahi hua.\n"
+                "✅ Instagram Messages route khola. Koi DM send nahi hua.\n"
                 "Next: /fetchgc se recent chats dikhao → desired chats select karo → /done se tabs prepare karo. "
-                "Workflow choose/import karne ke baad hi /start chalao; /screen se verify karo."
+                "Workflow choose/import karne ke baad hi /start chalao; /screen se verify karo.\n"
+                f"{res}"
             )
         else:
             await query.message.reply_text("Unknown Instagram action.")

@@ -195,6 +195,21 @@ class TestInstagramGuidedFlow(BotTestCase):
         asyncio.run(bot.cmd_instagram(update, MagicMock()))
         self.assertIn("private DM", msg.reply_text.await_args.args[0])
 
+    def test_messages_helper_uses_direct_inbox_url_for_active_profile(self):
+        fake = self.use_fake()
+        bot.current.update(host="220.158.164.87")
+        old = bot._open_url_for_profile
+        open_mock = AsyncMock(return_value="Navigation sent to inbox")
+        bot._open_url_for_profile = open_mock
+        try:
+            result = asyncio.run(bot._open_instagram_messages(fake))
+        finally:
+            bot._open_url_for_profile = old
+        open_mock.assert_awaited_once_with(
+            fake, "https://www.instagram.com/direct/inbox/", "220.158.164.87"
+        )
+        self.assertIn("inbox", result)
+
     def test_open_instagram_callback_offers_login_and_messages_for_private_chat(self):
         from types import SimpleNamespace
         fake = self.use_fake()
@@ -224,11 +239,12 @@ class TestInstagramGuidedFlow(BotTestCase):
         self.assertEqual(markup.inline_keyboard[1][0].callback_data, "igflow:messages")
         open_mock.assert_awaited_once_with(fake, "https://www.instagram.com/", "")
 
-    def test_messages_button_clicks_left_rail_icon_only(self):
-        from types import SimpleNamespace
+    def test_messages_button_opens_direct_inbox_without_coordinate_clicks(self):
         fake = self.use_fake()
-        fake.client = SimpleNamespace(width=1366, height=768)
         fake.ensure = AsyncMock()
+        old = bot._open_instagram_messages
+        inbox = AsyncMock(return_value="Navigation sent to Instagram inbox")
+        bot._open_instagram_messages = inbox
         bot.cfg["allowed_users"] = [111]
         query = MagicMock()
         query.data = "igflow:messages"
@@ -240,10 +256,12 @@ class TestInstagramGuidedFlow(BotTestCase):
         update.effective_chat.id = 555
         update.effective_chat.type = "private"
 
-        asyncio.run(bot.on_igflow_callback(update, MagicMock()))
+        try:
+            asyncio.run(bot.on_igflow_callback(update, MagicMock()))
+        finally:
+            bot._open_instagram_messages = old
 
-        actions = fake.execute.await_args[0][0]
-        self.assertIn(("click", 40, 307, 1, False), actions)
+        inbox.assert_awaited_once_with(fake)
         self.assertIn("Koi DM send nahi hua", query.message.reply_text.await_args.args[0])
 
     def test_connect_shows_instagram_button_and_autofocuses_edge_only_on_desktop(self):
@@ -291,6 +309,23 @@ class TestWebNavigation(BotTestCase):
         self.assertIn(("key", "alt+space"), actions)
         self.assertIn(("key", "x"), actions)
 
+    def test_remoteapp_65430_skips_old_taskbar_coordinates(self):
+        from PIL import Image
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        fake.cfg = {"rdp_host": "220.158.164.87", "rdp_port": 65430}
+        fake.screenshot_nowait = AsyncMock(return_value=Image.new("RGB", (1366, 768), "white"))
+        focused = asyncio.run(bot._focus_edge_window(fake))
+        self.assertFalse(focused)
+        actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
+        self.assertNotIn("click", [action[0] for action in actions])
+
+    def test_new_remoteapp_port_is_recognized(self):
+        fake = MagicMock()
+        fake.cfg = {"rdp_host": "220.158.164.87", "rdp_port": 65430}
+        self.assertTrue(bot._is_remoteapp(fake))
+
     def test_full_windows_rdp_launches_edge_then_uses_address_bar(self):
         from types import SimpleNamespace
         fake = self.use_fake()
@@ -308,7 +343,8 @@ class TestWebNavigation(BotTestCase):
             bot._looks_like_edge_window = old_looks
         focus.assert_awaited_once_with(fake)
         actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
-        self.assertIn(("click", 409, 61, 1, False), actions)
+        self.assertNotIn("click", [action[0] for action in actions])
+        self.assertIn(("key", "ctrl+l"), actions)
         self.assertIn(("key", "escape"), actions)
         self.assertEqual([a[1] for a in actions if a[0] == "text"], list("https://www.instagram.com"))
         self.assertIn("Navigation sent", result)
@@ -333,7 +369,8 @@ class TestWebNavigation(BotTestCase):
             bot._looks_like_edge_window = old_looks
         launch_mock.assert_not_awaited()
         calls = [a for call in fake.execute.await_args_list for a in call.args[0]]
-        self.assertIn(("click", 409, 61, 1, False), calls)
+        self.assertNotIn("click", [action[0] for action in calls])
+        self.assertIn(("key", "ctrl+l"), calls)
         self.assertEqual([a[1] for a in calls if a[0] == "text"], list("https://www.instagram.com"))
         self.assertIn("maximized", result)
 
