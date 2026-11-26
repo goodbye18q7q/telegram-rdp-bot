@@ -92,6 +92,23 @@ class TestAutomaFeatureControls(unittest.TestCase):
         self.assertIn(("click", 1044, row_y, 1, False), clicks)
         self.assertIn("Saved workflow 3", message.reply_text.await_args.args[0])
 
+    def test_auto_refresh_reloads_each_active_tab_then_notifies(self):
+        async def run():
+            flow = ChatFlow(run_state="running", active_tabs=[0, 1], profile="rdp1")
+            mgr = SimpleNamespace(ensure=AsyncMock(), execute=AsyncMock())
+            bot = SimpleNamespace(get_mgr=MagicMock(return_value=mgr),
+                                  _focus_edge_window=AsyncMock(return_value=True),
+                                  log=MagicMock())
+            telegram_bot = SimpleNamespace(send_message=AsyncMock(side_effect=lambda **kwargs:
+                setattr(flow, "run_state", "stopped")))
+            with unittest.mock.patch.object(automa_features, "AUTO_REFRESH_SECONDS", 0.005):
+                await automa_features._auto_refresh_tabs(self.chat_id, flow, bot, telegram_bot)
+            actions = [action for call in mgr.execute.await_args_list for action in call.args[0]]
+            self.assertEqual(sum(action == ("key", "ctrl+r") for action in actions), 2)
+            self.assertIn("may interrupt", telegram_bot.send_message.await_args.kwargs["text"])
+
+        asyncio.run(run())
+
     def test_start_requires_selected_groups_and_prepared_tabs(self):
         automa_features.flows[self.chat_id] = ChatFlow(workflow_name="Safe test")
         update, message = update_for_message(self.chat_id)

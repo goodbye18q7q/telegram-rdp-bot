@@ -6,6 +6,7 @@ Uploading imports only; execution happens through /start.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import os
@@ -22,6 +23,8 @@ from automa_runtime import ChatFlow, GroupChoice, WorkflowVault, MAX_SELECTED_GR
 vault = WorkflowVault(ttl_seconds=600)
 flows: dict[int, ChatFlow] = {}
 _download_names: dict[str, str] = {}
+_auto_refresh_tasks: dict[int, asyncio.Task] = {}
+AUTO_REFRESH_SECONDS = 300
 INBOX_URL = "https://www.instagram.com/direct/inbox/"
 
 
@@ -388,8 +391,56 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Import verify nahi hua: {exc}. Workflow run nahi hua.")
 
 
+async def _cancel_auto_refresh(chat_id: int) -> None:
+    task = _auto_refresh_tasks.pop(chat_id, None)
+    if task and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _auto_refresh_tabs(chat_id: int, flow: ChatFlow, bot, telegram_bot) -> None:
+    """Reload each prepared tab every five minutes while the user-selected run is tracked."""
+    this_task = asyncio.current_task()
+    try:
+        while flow.run_state == "running":
+            await asyncio.sleep(AUTO_REFRESH_SECONDS)
+            if flow.run_state != "running":
+                break
+            mgr = bot.get_mgr(flow.profile)
+            await mgr.ensure()
+            if not await bot._focus_edge_window(mgr):
+                raise RuntimeError("Browser focus could not be verified; skipped the scheduled reload")
+            await _maximize_edge(mgr)
+            tab_count = len(flow.active_tabs)
+            for position in range(tab_count):
+                if flow.run_state != "running":
+                    break
+                await mgr.execute([("key", "ctrl+r"), ("wait", 6.0)])
+                if position < tab_count - 1:
+                    await mgr.execute([("key", "ctrl+shift+tab"), ("wait", 0.5)])
+            if flow.run_state == "running":
+                await telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔄 5-minute auto-refresh: {tab_count} workflow tab(s) reloaded. Reload may interrupt a running flow or cause a configured page-load trigger to run again; use /stop to end auto-refresh.",
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        bot.log.exception("five-minute workflow tab refresh failed")
+        with contextlib.suppress(Exception):
+            await telegram_bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Scheduled tab refresh failed; no further auto-refresh will run. Check /screen. Error: {exc}",
+            )
+    finally:
+        if _auto_refresh_tasks.get(chat_id) is this_task:
+            _auto_refresh_tasks.pop(chat_id, None)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    flow = flows.get(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    flow = flows.get(chat_id)
     if not flow or not flow.confirmed or not flow.active_tabs:
         await update.message.reply_text("Pehle /fetchgc → groups select → /done se tabs ready karo.")
         return
@@ -397,9 +448,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> 
         await update.message.reply_text("Pehle /workflow se saved workflow select karo ya /setautoma se naya JSON import karo.")
         return
     label = flow.workflow_name or f"Saved workflow {flow.saved_workflow_index + 1}"
+    await _cancel_auto_refresh(chat_id)
     try:
         count = await _run_flow_once_per_tab(flow, bot)
-        await update.message.reply_text(f"Run clicks bheje: ‘{label}’ selected tab(s) par ({count}). Workflow ke apne repeat/loop blocks as-is chalenge. /stop se rukao; /screen se verify karo.")
+        _auto_refresh_tasks[chat_id] = asyncio.create_task(
+            _auto_refresh_tabs(chat_id, flow, bot, context.bot)
+        )
+        await update.message.reply_text(
+            f"Run clicks bheje: ‘{label}’ selected tab(s) par ({count}). Workflow loops as-is chalenge. "
+            "Har 5 minute selected tab(s) reload honge; isse active run ruk sakta hai ya page-load trigger dobara chal sakta hai. "
+            "/stop se workflow aur auto-refresh dono rokne ki koshish karo; /screen se verify karo."
+        )
     except Exception as exc:
         flow.run_state = "partial"
         bot.log.exception("/start Automa run failed")
@@ -411,6 +470,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
     if not flow or flow.run_state not in ("starting", "running", "partial"):
         await update.message.reply_text("Koi active Automa run tracked nahi hai.")
         return
+    await _cancel_auto_refresh(update.effective_chat.id)
     try:
         mgr = bot.get_mgr(flow.profile)
         await mgr.ensure()
