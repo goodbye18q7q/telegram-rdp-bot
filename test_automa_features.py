@@ -23,12 +23,13 @@ def update_for_message(chat_id: int = 99):
 
 class TestAutomaFeatureControls(unittest.TestCase):
     @staticmethod
-    def inbox_image(rows: int) -> Image.Image:
+    def inbox_image(rows: int, gray_first: bool = False) -> Image.Image:
         image = Image.new("RGB", (1366, 768), "white")
         draw = ImageDraw.Draw(image)
         for i in range(rows):
-            y = 393 + 73*i
-            draw.ellipse((118, y, 162, y+47), fill=(190, 85 + i*20, 120))
+            y = 400 + 73*i
+            color = (205, 205, 205) if gray_first and i == 0 else (190, 85 + i*20, 120)
+            draw.ellipse((132, y, 177, y+47), fill=color)
         return image
 
     @staticmethod
@@ -203,6 +204,23 @@ class TestAutomaFeatureControls(unittest.TestCase):
         mgr.execute.assert_not_awaited()
         bot._focus_edge_window.assert_not_awaited()
 
+    def test_chrome_automa_dashboard_opens_home_and_maximizes_small_window(self):
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768),
+                              cfg={"rdp_port":65430}, ensure=AsyncMock(),
+                              screenshot=AsyncMock(side_effect=[Image.new("RGB",(1366,768),"white"),
+                                                               self.dashboard_image()]),
+                              execute=AsyncMock())
+        bot = SimpleNamespace(_is_remoteapp=lambda _mgr: True,
+                              _focus_edge_window=AsyncMock(return_value=True))
+        old = automa_features._open_automa_popup
+        automa_features._open_automa_popup = AsyncMock()
+        try:
+            asyncio.run(automa_features._open_automa_dashboard(bot, mgr))
+        finally:
+            automa_features._open_automa_popup = old
+        clicks = [a for call in mgr.execute.await_args_list for a in call.args[0] if a[0] == "click"]
+        self.assertEqual(clicks, [("click",1178,133,1,False),("click",638,15,1,False)])
+
     def test_dashboard_detector_rejects_blank_white_page(self):
         self.assertFalse(automa_features._automa_dashboard_visible(Image.new("RGB", (1366,768), "white")))
         self.assertTrue(automa_features._automa_dashboard_visible(self.dashboard_image()))
@@ -218,6 +236,19 @@ class TestAutomaFeatureControls(unittest.TestCase):
             asyncio.run(automa_features._open_automa_popup(bot, mgr))
         clicks = [a for call in mgr.execute.await_args_list for a in call.args[0] if a[0] == "click"]
         self.assertEqual(clicks, [("click", 1122, 67, 1, False)])
+
+    def test_chrome_remoteapp_uses_its_automa_icon_and_play_control_positions(self):
+        mgr = SimpleNamespace(client=SimpleNamespace(width=1366, height=768),
+                              cfg={"rdp_host":"220.158.164.87", "rdp_port":65430})
+        bot = SimpleNamespace(_is_remoteapp=lambda _mgr: True)
+        self.assertEqual(automa_features._automa_toolbar_icon(bot, mgr), (1217, 62))
+        self.assertEqual(automa_features._automa_run_x(bot, mgr), 1139)
+        popup = Image.new("RGB", (1366,768), "white")
+        draw = ImageDraw.Draw(popup)
+        draw.rectangle((868,80,1221,277), fill=(20,20,20))
+        draw.line([(1135,329),(1144,335),(1135,341),(1135,329)], fill="black", width=2)
+        self.assertTrue(automa_features._automa_popup_visible(popup, chrome_remoteapp=True))
+        self.assertEqual(automa_features._classify_run_control(popup, 335, 1139), "play")
 
     def test_edge_focus_retries_taskbar_restore_and_verifies_chrome(self):
         from bot import _focus_edge_window
@@ -241,6 +272,7 @@ class TestAutomaFeatureControls(unittest.TestCase):
     def test_visible_rows_only_returns_nonblank_avatar_slots(self):
         image = self.inbox_image(2)
         self.assertEqual(automa_features.visible_chat_rows(image), [0, 1])
+        self.assertEqual(automa_features.visible_chat_rows(self.inbox_image(2, gray_first=True)), [0, 1])
         self.assertEqual(automa_features.visible_chat_rows(Image.new("RGB", (1366, 768), "white")), [])
 
     def test_fetchgc_offers_buttons_for_detected_rows(self):

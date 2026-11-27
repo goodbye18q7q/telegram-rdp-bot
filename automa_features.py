@@ -30,22 +30,29 @@ INBOX_URL = "https://www.instagram.com/direct/inbox/"
 
 
 def visible_chat_rows(image: Image.Image, limit: int = MAX_SELECTED_GROUPS) -> list[int]:
-    """Find nonblank visible inbox rows by avatar pixels; returns zero-based indexes."""
+    """Find visible Instagram inbox avatar slots, including grey/default avatars.
+
+    This Chrome layout puts the left chat pane at x≈130 and its first row around
+    y≈400 at 1366x768. Some valid rows use a low-saturation placeholder avatar,
+    so stop only on a genuinely blank (white) slot rather than requiring color.
+    """
     rgb = image.convert("RGB")
     width, height = rgb.size
     sx, sy = width / 1366.0, height / 768.0
     found: list[int] = []
     for i in range(limit):
-        x0, y0 = int(116*sx), int((393 + 73*i)*sy)
-        x1, y1 = int(165*sx), int((440 + 73*i)*sy)
+        x0, y0 = int(130*sx), int((400 + 73*i)*sy)
+        x1, y1 = int(180*sx), int((450 + 73*i)*sy)
         if y1 > height or x1 > width:
             break
         pixels = list(rgb.crop((x0, y0, x1, y1)).get_flattened_data())
         if not pixels:
             break
         saturated = sum(1 for r, g, b in pixels if max(r, g, b) - min(r, g, b) > 35 and max(r, g, b) > 80)
-        dark = sum(1 for r, g, b in pixels if max(r, g, b) < 220)
-        if saturated / len(pixels) < 0.035 and dark / len(pixels) < 0.22:
+        nonwhite = sum(1 for r, g, b in pixels if max(r, g, b) < 245)
+        # A plain grey placeholder avatar still has a visible silhouette; a
+        # truly empty list slot is near-white and has almost no saturated pixels.
+        if saturated / len(pixels) < 0.005 and nonwhite / len(pixels) < 0.04:
             break
         found.append(i)
     return found
@@ -65,16 +72,41 @@ def _scale(mgr, x: int, y: int) -> tuple[int, int]:
     return int(x * mgr.client.width / 1366), int(y * mgr.client.height / 768)
 
 
+def _chrome_remoteapp(bot, mgr) -> bool:
+    checker = getattr(bot, "_is_remoteapp", None)
+    if checker:
+        try:
+            return bool(checker(mgr))
+        except Exception:
+            pass
+    cfg = getattr(mgr, "cfg", {}) or {}
+    try:
+        return int(cfg.get("rdp_port", 3389)) in {65430, 8250}
+    except (TypeError, ValueError):
+        return False
+
+
+def _automa_toolbar_icon(bot, mgr) -> tuple[int, int]:
+    # Automa is pinned beside Chrome's puzzle icon on the new Tally RemoteApp.
+    return _scale(mgr, 1217, 62) if _chrome_remoteapp(bot, mgr) else _scale(mgr, 1122, 67)
+
+
+def _automa_run_x(bot, mgr) -> int:
+    # Chrome popup is anchored at the right edge; its Play/Stop controls are
+    # around x=1139. The older Edge layout used x=1044.
+    return 1139 if _chrome_remoteapp(bot, mgr) else 1366-322
+
+
 def _target_keys(flow: ChatFlow) -> list[str]:
     digest = flow.workflow_digest or ""
     profile = flow.profile or "active"
     return [hashlib.sha256(f"{digest}:{profile}:{idx}".encode()).hexdigest() for idx in sorted(flow.selected)]
 
 
-def _classify_run_control(image: Image.Image, row_center_y: int = 335) -> str:
+def _classify_run_control(image: Image.Image, row_center_y: int = 335, control_x: int = 1366-322) -> str:
     """Distinguish the selected Automa row's Play triangle from its Stop square."""
     sx, sy = image.width / 1366.0, image.height / 768.0
-    cx, cy = int((1366-322)*sx), int(row_center_y*sy)
+    cx, cy = int(control_x*sx), int(row_center_y*sy)
     crop = image.convert("RGB").crop((cx-int(9*sx), cy-int(10*sy), cx+int(9*sx), cy+int(10*sy)))
     w, h = crop.size
     points = [(i % w, i // w) for i, (r, g, b) in enumerate(crop.get_flattened_data()) if max(r, g, b) < 100]
@@ -92,9 +124,12 @@ def _classify_run_control(image: Image.Image, row_center_y: int = 335) -> str:
     return "unknown"
 
 
-def _automa_popup_visible(image: Image.Image) -> bool:
+def _automa_popup_visible(image: Image.Image, chrome_remoteapp: bool = False) -> bool:
     sx, sy = image.width / 1366.0, image.height / 768.0
-    box = (int(772*sx), int(84*sy), int(1123*sx), int(277*sy))
+    if chrome_remoteapp:
+        box = (int(867*sx), int(80*sy), int(1222*sx), int(277*sy))
+    else:
+        box = (int(772*sx), int(84*sy), int(1123*sx), int(277*sy))
     crop = image.convert("RGB").crop(box)
     pixels = list(crop.get_flattened_data())
     return bool(pixels) and sum(max(rgb) < 80 for rgb in pixels) / len(pixels) > 0.55
@@ -113,20 +148,21 @@ def _automa_dashboard_visible(image: Image.Image) -> bool:
 
 
 async def _maximize_edge(mgr) -> None:
-    """Normalize Edge to full screen before using browser-toolbar coordinates."""
-    await mgr.execute([("key", "alt+space"), ("wait", 0.5), ("key", "x"),
-                       ("wait", 0.8), ("key", "escape"), ("wait", 0.3)])
+    """Normalize Chrome/Edge before using toolbar coordinates."""
+    await mgr.execute([("key", "alt+space"), ("wait", 0.4), ("key", "x"),
+                       ("wait", 0.4), ("key", "win+up"), ("wait", 0.7),
+                       ("key", "escape"), ("wait", 0.3)])
 
 
 async def _open_automa_popup(bot, mgr) -> None:
-    """Open and positively verify the Automa popup on maximized Edge."""
+    """Open and verify Automa on the active Chrome/Edge toolbar."""
     await mgr.ensure()
     if not await bot._focus_edge_window(mgr):
-        raise RuntimeError("Edge window could not be focused; refusing Automa clicks")
+        raise RuntimeError("Normal browser window could not be focused; refusing Automa clicks")
     await _maximize_edge(mgr)
-    x, y = _scale(mgr, 1366-244, 67)
+    x, y = _automa_toolbar_icon(bot, mgr)
     await mgr.execute([("click", x, y, 1, False), ("wait", 1.0)])
-    if not _automa_popup_visible(await mgr.screenshot()):
+    if not _automa_popup_visible(await mgr.screenshot(), _chrome_remoteapp(bot, mgr)):
         await mgr.execute([("key", "escape")])
         raise RuntimeError("Automa popup was not detected; stopped before clicking the page")
 
@@ -139,9 +175,20 @@ async def _focus_existing_automa_dashboard(mgr) -> bool:
 
 
 async def _open_automa_dashboard(bot, mgr) -> None:
-    """Use an already-open dashboard, restore it from taskbar, or launch it safely."""
+    """Use or open the Automa dashboard without assuming an Edge taskbar slot."""
     await mgr.ensure()
     if _automa_dashboard_visible(await mgr.screenshot()):
+        return
+    if _chrome_remoteapp(bot, mgr):
+        # Chrome's Automa home button opens a small standalone dashboard window.
+        # Maximize that window before using import/search coordinates.
+        await _open_automa_popup(bot, mgr)
+        hx, hy = _scale(mgr, 1178, 133)
+        await mgr.execute([("click", hx, hy, 1, False), ("wait", 2.0)])
+        mx, my = _scale(mgr, 638, 15)
+        await mgr.execute([("click", mx, my, 1, False), ("wait", 1.5)])
+        if not _automa_dashboard_visible(await mgr.screenshot()):
+            raise RuntimeError("Chrome Automa dashboard was not detected after maximizing")
         return
     if await _focus_existing_automa_dashboard(mgr):
         return
@@ -170,7 +217,7 @@ async def cmd_fetchgc(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -
             await update.message.reply_text("No chats found.")
             return
         flow = flows.setdefault(update.effective_chat.id, ChatFlow())
-        flow.set_choices([GroupChoice(i+1, f"Inbox chat {i+1}", 393+73*i) for i in rows])
+        flow.set_choices([GroupChoice(i+1, f"Inbox chat {i+1}", 400+73*i) for i in rows])
         buf = io.BytesIO(); image.save(buf, format="PNG"); buf.seek(0)
         await update.message.reply_photo(
             photo=buf,
@@ -201,6 +248,24 @@ async def on_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, b
     await query.answer("Selected" if selected else "Removed")
 
 
+async def _open_url_in_new_tab(bot, mgr, url: str) -> None:
+    """Open a URL in a verified browser tab, using the RemoteApp omnibox position."""
+    if not await bot._focus_edge_window(mgr):
+        raise RuntimeError("Normal Chrome/Edge window could not be focused")
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    width, height = mgr.client.width, mgr.client.height
+    if bot._is_remoteapp(mgr):
+        focus = [("click", int(width*0.366), int(height*0.08), 1, False)]
+    else:
+        focus = [("key", "ctrl+l")]
+    await mgr.execute(focus + [("key", "ctrl+a"), ("key", "backspace")])
+    for char in url:
+        await mgr.execute([("text", char)])
+        await asyncio.sleep(0.08)
+    await mgr.execute([("key", "alt+enter"), ("wait", 4.0)])
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     flow = flows.get(update.effective_chat.id)
     if not flow:
@@ -216,7 +281,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
         await mgr.ensure()
         for position, choice in enumerate(selected):
             if position:
-                await mgr.execute([("key", "ctrl+l"), ("text", INBOX_URL), ("key", "alt+enter"), ("wait", 4.0)])
+                await _open_url_in_new_tab(bot, mgr, INBOX_URL)
             x, y = _scale(mgr, 260, choice.row_y + 24)
             await mgr.execute([("click", x, y, 1, False), ("wait", 3.0)])
         flow.active_tabs = list(range(len(selected)))
@@ -315,9 +380,10 @@ async def _run_flow_once_per_tab(flow: ChatFlow, bot) -> int:
     await mgr.ensure()
     for _ in flow.active_tabs:
         image, row_y = await _open_selected_workflow_popup(flow, bot, mgr)
-        if _classify_run_control(image, row_y) != "play":
+        control_x = _automa_run_x(bot, mgr)
+        if _classify_run_control(image, row_y, control_x) != "play":
             raise RuntimeError("Selected workflow Play control not detected; no click sent")
-        rx, ry = _scale(mgr, 1366-322, row_y)
+        rx, ry = _scale(mgr, control_x, row_y)
         await mgr.execute([("click", rx, ry, 1, False), ("wait", 1.0)])
         flow.run_completed += 1
         if flow.run_completed < len(flow.active_tabs):
@@ -372,8 +438,7 @@ async def on_workflow_document(update: Update, context: ContextTypes.DEFAULT_TYP
         if not await bot._focus_edge_window(mgr):
             raise RuntimeError("Edge could not be focused for the temporary workflow download")
         await _maximize_edge(mgr)
-        await mgr.execute([("key", "ctrl+l"), ("text", f"{base}/automa-file/{token}"),
-                           ("key", "enter"), ("wait", 6.0)])
+        await bot._navigate_browser_addressbar(mgr, f"{base}/automa-file/{token}")
         await _open_automa_dashboard(bot, mgr)
         x, y = _scale(mgr, 1080, 179)
         username = (mgr.cfg.get("rdp_user") or "testing").split("\\")[-1]
@@ -480,8 +545,9 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
         clicked = 0
         for position, _ in enumerate(flow.active_tabs):
             image, row_y = await _open_selected_workflow_popup(flow, bot, mgr)
-            rx, ry = _scale(mgr, 1366-322, row_y)
-            if _classify_run_control(image, row_y) == "stop":
+            control_x = _automa_run_x(bot, mgr)
+            rx, ry = _scale(mgr, control_x, row_y)
+            if _classify_run_control(image, row_y, control_x) == "stop":
                 await mgr.execute([("click", rx, ry, 1, False), ("wait", 1.0)])
                 clicked += 1
             if position < len(flow.active_tabs) - 1:

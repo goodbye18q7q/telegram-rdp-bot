@@ -61,8 +61,9 @@ current: dict = {"name": None, "host": "", "port": 3389, "user": "", "password":
 managers: dict[str, RDPManager] = {}
 # chat_id -> {"step": "ip"|"user"|"pass", "host": ..., "port": ...}
 connect_sessions: dict[int, dict] = {}
-# chat_id -> [(title, url), ...] last search results
+# chat_id -> [(title, url), ...] last search results + exact query for fallback.
 search_sessions: dict[int, list[tuple[str, str]]] = {}
+search_queries: dict[int, str] = {}
 # One-shot Instagram login state; passwords are never stored in this dict.
 ig_login_sessions: dict[int, dict[str, str]] = {}
 
@@ -324,23 +325,64 @@ BROWSER_CANDIDATES = [
 
 
 def _looks_like_edge_window(image) -> bool:
-    """Check for browser tab/address-bar chrome, not just a bright page."""
+    """Detect a normal Chrome/Edge window by its browser navigation controls.
+
+    The new Tally profile launches Instagram as a Chrome app window with no
+    omnibox. A page's dark Instagram icons are not enough evidence that Ctrl+L
+    can navigate, so require the standard browser toolbar's reload/address area.
+    """
     width, height = image.size
-    band = image.convert("RGB").crop((int(width*.06), int(height*.04),
-                                      int(width*.80), int(height*.12)))
-    pixels = list(band.get_flattened_data())
+    rgb = image.convert("RGB")
+    # Standard Chrome/Edge keeps Back/Forward/Reload in this left toolbar band;
+    # the standalone Instagram app window has none of these controls.
+    nav = rgb.crop((int(width*.055), int(height*.055),
+                    int(width*.09), int(height*.105)))
+    pixels = list(nav.get_flattened_data())
     if not pixels:
         return False
-    # Chrome and Edge both expose dark, low-saturation text/icons here. The
-    # Automa dashboard canvas is mostly white and is not sufficient evidence.
-    chrome_ink = sum(max(rgb) < 175 and max(rgb)-min(rgb) < 45 for rgb in pixels)
-    return chrome_ink / len(pixels) > 0.012
+    nav_ink = sum(max(px) < 150 and max(px)-min(px) < 60 for px in pixels) / len(pixels)
+    return nav_ink > 0.02
 
 
 async def _maximize_foreground_window(mgr) -> None:
-    """Restore/maximize the foreground app using Windows' system menu."""
+    """Restore/maximize the foreground app with two standard Windows methods."""
     await mgr.execute([("key", "alt+space"), ("wait", 0.4), ("key", "x"),
-                       ("wait", 0.8), ("key", "escape"), ("wait", 0.2)])
+                       ("wait", 0.5), ("key", "win+up"), ("wait", 0.8),
+                       ("key", "escape"), ("wait", 0.2)])
+
+
+async def _ensure_remoteapp_chrome_window(mgr) -> bool:
+    """Turn the RemoteApp Instagram app-window into an addressable Chrome window.
+
+    This RDP starts Instagram as a standalone Chrome app (no address bar). Focus
+    its safe title bar, use Ctrl+N to open a standard Chrome window, then verify
+    the Back/Reload/omnibox toolbar before any URL text is typed.
+    """
+    image = await mgr.screenshot_nowait()
+    if _looks_like_edge_window(image):
+        await _maximize_foreground_window(mgr)
+        return _looks_like_edge_window(await mgr.screenshot_nowait())
+
+    width, height = mgr.client.width, mgr.client.height
+    # The standalone Instagram app window is initially a small top-left window.
+    # Its maximize control is at the old measured point; after that, focus the
+    # title strip near the center before Ctrl+N (x≈800 reliably activates it).
+    await mgr.execute([("click", int(width*.35), int(height*.033), 1, False), ("wait", 0.3),
+                       ("click", int(width*.586), max(8, int(height*.025)), 1, False),
+                       ("wait", 0.3)])
+    image = await mgr.screenshot_nowait()
+    if _looks_like_edge_window(image):
+        await _maximize_foreground_window(mgr)
+        return _looks_like_edge_window(await mgr.screenshot_nowait())
+
+    # Ctrl+N from the standalone Instagram app opens regular Chrome with an
+    # omnibox. Verify the toolbar before navigating; never type into a page.
+    await mgr.execute([("key", "ctrl+n"), ("wait", 1.5)])
+    image = await mgr.screenshot_nowait()
+    if not _looks_like_edge_window(image):
+        return False
+    await _maximize_foreground_window(mgr)
+    return _looks_like_edge_window(await mgr.screenshot_nowait())
 
 
 async def _focus_edge_window(mgr) -> bool:
@@ -353,6 +395,21 @@ async def _focus_edge_window(mgr) -> bool:
     screenshot-verified.
     """
     width, height = mgr.client.width, mgr.client.height
+    if _is_remoteapp(mgr):
+        if await _ensure_remoteapp_chrome_window(mgr):
+            return True
+        # The existing Chrome/PWA may be behind the Busy Data chooser or
+        # minimized after a prior session; cycle windows before launching anew.
+        for _ in range(2):
+            await mgr.execute([("key", "alt+tab"), ("wait", 0.7)])
+            if await _ensure_remoteapp_chrome_window(mgr):
+                return True
+        opened = await _open_browser_via_run(mgr, None)
+        if opened and "Not found" not in opened:
+            await asyncio.sleep(1.0)
+            return await _ensure_remoteapp_chrome_window(mgr)
+        return False
+
     initial = await mgr.screenshot_nowait()
     if _looks_like_edge_window(initial):
         await _maximize_foreground_window(mgr)
@@ -376,15 +433,19 @@ async def _focus_edge_window(mgr) -> bool:
 
 
 async def _navigate_browser_addressbar(mgr, url: str) -> None:
-    """Navigate the foreground browser without layout-specific coordinate clicks."""
+    """Navigate a verified normal browser window, never the Instagram app page."""
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
-    # Ctrl+L targets the browser address bar across Chrome/Edge layouts and
-    # resolutions; a fixed click near the old toolbar/search field is brittle.
-    await mgr.execute([
-        ("key", "escape"), ("wait", 0.2),
-        ("key", "ctrl+l"), ("key", "ctrl+a"), ("key", "backspace"),
-    ])
+    if _is_remoteapp(mgr):
+        # The Chrome app window has no omnibox; _focus_edge_window first opens
+        # and verifies a normal Chrome window. Click its actual omnibox so key
+        # delivery is reliable after an RDP reconnect, then replace the URL.
+        width, height = mgr.client.width, mgr.client.height
+        start = [("key", "escape"), ("wait", 0.2),
+                 ("click", int(width * 0.366), int(height * 0.08), 1, False)]
+    else:
+        start = [("key", "escape"), ("wait", 0.2), ("key", "ctrl+l")]
+    await mgr.execute(start + [("key", "ctrl+a"), ("key", "backspace")])
     for char in url:
         await mgr.execute([("text", char)])
         await asyncio.sleep(0.12)
@@ -397,22 +458,23 @@ async def _open_url_for_profile(mgr, url: str, host: str | None = None) -> str |
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
 
-    # Reuse the already-open browser first so its existing login/profile is kept.
-    # Do not launch another browser window unless focus/restore could not be verified.
+    # Reuse the existing browser profile when possible. RemoteApp's Instagram
+    # PWA lacks an address bar, so _focus_edge_window converts it to a verified
+    # standard Chrome window before search/navigation commands are sent.
+    remoteapp = _is_remoteapp(mgr, host)
     focused = await _focus_edge_window(mgr)
     if not focused:
-        if _is_remoteapp(mgr, host):
-            opened = await _open_browser_via_run(mgr, None)  # Chrome is installed on RemoteApp.
-        else:
-            opened = await _win_via_freerdp(mgr, "msedge")
-            if not opened or "Not found" in opened:
-                opened = await _open_browser_via_run(mgr, None)
+        if remoteapp:
+            return "Chrome/Instagram window could not be focused or opened; check /screen and RemoteApp launch policy"
+        opened = await _win_via_freerdp(mgr, "msedge")
+        if not opened or "Not found" in opened:
+            opened = await _open_browser_via_run(mgr, None)
         if not opened or "Not found" in opened:
             return opened or "Not found: browser"
-        await asyncio.sleep(2.0)
-        await _maximize_foreground_window(mgr)
-        if not _looks_like_edge_window(await mgr.screenshot_nowait()):
-            return "Browser launch reported, but foreground browser could not be verified"
+        await asyncio.sleep(1.5)
+        focused = await _focus_edge_window(mgr)
+        if not focused:
+            return "Browser launched, but a normal address-bar window could not be verified"
 
     # _focus_edge_window already restored, maximized, and verified the foreground
     # browser. Verify browser chrome remains on-screen after navigation; this is
@@ -1574,6 +1636,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # Fetch results via DuckDuckGo (numbered)
         results = await asyncio.to_thread(fetch_search_results, query, 5)
         search_sessions[chat_id] = results
+        search_queries[chat_id] = query
         # Build message
         lines = [f"🔍 *{query}* — select karo (1-{len(results)}):\n"]
         for i, (title, url) in enumerate(results, 1):
@@ -1606,13 +1669,14 @@ async def on_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     results = search_sessions.get(chat_id, [])
     try:
         if data == "search:0":
-            # open google search directly
-            # need original query — reconstruct from last search? For now open google.com
-            # Find last query from results title?
-            # Use first result's google url if available, else google
-            url = results[0][1] if results and "google.com/search" in results[0][1] else "https://www.google.com"
-            # If results empty, try to get query from message text
-            # Fallback: open google
+            # Keep the actual query for this fallback button; don't silently open
+            # the Google homepage when search results came from a site alias.
+            import urllib.parse
+            search_query = search_queries.get(chat_id, "").strip()
+            if not search_query:
+                await query.edit_message_text("Search session expire ho gayi. /search <query> dobara chalao.")
+                return
+            url = "https://www.google.com/search?q=" + urllib.parse.quote(search_query)
         else:
             idx = int(data.split(":")[1]) - 1
             if idx < 0 or idx >= len(results):
@@ -1774,10 +1838,15 @@ async def cmd_ui(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"🎮 Virtual Keyboard + Mouse:\n{url}\n\n• Screen pe tap = click\n• Pad drag = mouse move\n• Type box + keyboard\n• Fix Black button\n• Har RDP apne lock me — dusre ko block nahi karega")
 
 async def _window_command(update: Update, actions: list, success: str) -> None:
-    """Apply a system-level window shortcut to the focused RDP window."""
+    """Focus the active RemoteApp title bar, then send its window shortcut."""
     try:
         mgr = get_mgr()
         await mgr.ensure()
+        if _is_remoteapp(mgr):
+            # RDP keyboard input can arrive while the RemoteApp window is not
+            # foregrounded. This top-strip click activates Chrome without page clicks.
+            await mgr.execute([("click", int(mgr.client.width*.35),
+                                max(8, int(mgr.client.height*.025)), 1, False)])
         await mgr.execute(actions)
         await update.message.reply_text(success)
     except Exception as e:
@@ -1801,8 +1870,26 @@ async def cmd_maximize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                           "✅ Maximize command sent to the focused window.")
 
 
+def _looks_like_remoteapp_launcher(image) -> bool:
+    """Detect the centered Busy Data app chooser over the blue RDP background."""
+    width, height = image.size
+    rgb = image.convert("RGB")
+    center = list(rgb.crop((int(width*.30), int(height*.30),
+                            int(width*.70), int(height*.70))).get_flattened_data())
+    side_a = list(rgb.crop((0, int(height*.15), int(width*.25), int(height*.85))).get_flattened_data())
+    side_b = list(rgb.crop((int(width*.75), int(height*.15), width, int(height*.85))).get_flattened_data())
+    if not center or not side_a or not side_b:
+        return False
+    center_light = sum(min(px) > 210 for px in center) / len(center)
+    side_blue = sum(px[2] > px[0]*1.15 and px[2] > px[1]*1.05 and px[2] > 80
+                    for px in side_a + side_b) / (len(side_a) + len(side_b))
+    return center_light > 0.45 and side_blue > 0.65
+
+
 def _looks_like_windows_desktop(image) -> bool:
-    """Recognize the blue desktop used by this RDP profile before sending Alt+F4."""
+    """Recognize the bare blue desktop, not the app chooser sitting on it."""
+    if _looks_like_remoteapp_launcher(image):
+        return False
     width, height = image.size
     crop = image.convert("RGB").crop((int(width*.12), int(height*.12), int(width*.88), int(height*.86)))
     pixels = list(crop.get_flattened_data())
@@ -1823,6 +1910,16 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             before = await mgr.screenshot()
             if _looks_like_windows_desktop(before):
                 break
+            if _is_remoteapp(mgr):
+                if _looks_like_remoteapp_launcher(before):
+                    # The Busy Data chooser is a centered window over the blue
+                    # desktop. Focus its empty header before closing it.
+                    await mgr.execute([("click", int(mgr.client.width*.50),
+                                        int(mgr.client.height*.36), 1, False)])
+                else:
+                    # Activate the top-level Chrome/Automa title bar, not the page.
+                    await mgr.execute([("click", int(mgr.client.width*.35),
+                                        max(8, int(mgr.client.height*.025)), 1, False)])
             await mgr.execute([("key", "alt+f4"), ("wait", 0.8)])
             closed += 1
             after = await mgr.screenshot()

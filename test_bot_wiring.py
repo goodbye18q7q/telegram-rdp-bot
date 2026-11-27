@@ -43,6 +43,8 @@ class BotTestCase(unittest.TestCase):
         bot.managers.clear()
         bot.connect_sessions.clear()
         bot.ig_login_sessions.clear()
+        bot.search_sessions.clear()
+        bot.search_queries.clear()
         bot.current.update(name=None, host="", port=3389, user="", password="")
         bot.cfg["allowed_users"] = []
 
@@ -61,6 +63,42 @@ class BotTestCase(unittest.TestCase):
 
 
 class TestWiring(BotTestCase):
+    def test_start_replies_with_help_text(self):
+        update, msg = make_update("/start")
+        asyncio.run(bot.cmd_start(update, MagicMock()))
+        msg.reply_text.assert_awaited_once_with(bot.HELP_TEXT)
+
+    def test_search_fallback_opens_exact_query(self):
+        from types import SimpleNamespace
+        update, msg = make_update("/search wallpaper 4k")
+        update.effective_chat.type = "private"
+        context = SimpleNamespace(args=["wallpaper", "4k"])
+        real_fetch = bot.fetch_search_results
+        bot.fetch_search_results = lambda query, limit: [("Result", "https://example.com")]
+        try:
+            asyncio.run(bot.cmd_search(update, context))
+        finally:
+            bot.fetch_search_results = real_fetch
+        self.assertEqual(bot.search_queries[555], "wallpaper 4k")
+        self.assertEqual(bot.search_sessions[555], [("Result", "https://example.com")])
+        callback = MagicMock()
+        callback.data = "search:0"
+        callback.answer = AsyncMock()
+        callback.edit_message_text = AsyncMock()
+        callback.message.reply_text = AsyncMock()
+        update.callback_query = callback
+        fake = self.use_fake()
+        bot.current.update(host="220.158.164.87")
+        real_open = bot._open_url_for_profile
+        open_mock = AsyncMock(return_value="Navigation sent")
+        bot._open_url_for_profile = open_mock
+        try:
+            asyncio.run(bot.on_search_callback(update, MagicMock()))
+        finally:
+            bot._open_url_for_profile = real_open
+        self.assertEqual(open_mock.await_args.args[1], "https://www.google.com/search?q=wallpaper%204k")
+        self.assertIs(open_mock.await_args.args[0], fake)
+
     def test_all_handlers_defined(self):
         # main() jo handlers register karta hai, sab exist karne chahiye
         for name in (
@@ -98,6 +136,33 @@ class TestWiring(BotTestCase):
         asyncio.run(bot.cmd_close(update, MagicMock()))
         fake.execute.assert_not_awaited()
         self.assertIn("Closed 0 visible window", msg.reply_text.await_args.args[0])
+
+    def test_busy_data_launcher_is_not_misidentified_as_bare_desktop(self):
+        from PIL import Image, ImageDraw
+        image = Image.new("RGB", (1366,768), (55,115,170))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((426,248,937,518), fill="white")
+        draw.rectangle((426,347,937,353), fill=(240,160,60))
+        self.assertTrue(bot._looks_like_remoteapp_launcher(image))
+        self.assertFalse(bot._looks_like_windows_desktop(image))
+
+    def test_close_closes_remoteapp_launcher_then_stops_at_desktop(self):
+        from PIL import Image, ImageDraw
+        launcher = Image.new("RGB", (1366,768), (55,115,170))
+        draw = ImageDraw.Draw(launcher)
+        draw.rectangle((426,248,937,518), fill="white")
+        draw.rectangle((426,347,937,353), fill=(240,160,60))
+        desktop = Image.new("RGB", (1366,768), (0,120,215))
+        fake = self.use_fake()
+        fake.client = MagicMock(width=1366, height=768)
+        fake.cfg = {"rdp_host":"220.158.164.87", "rdp_port":65430}
+        fake.ensure = AsyncMock()
+        fake.screenshot = AsyncMock(side_effect=[launcher, desktop])
+        update, msg = make_update("/close")
+        asyncio.run(bot.cmd_close(update, MagicMock()))
+        actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
+        self.assertIn(("key", "alt+f4"), actions)
+        self.assertIn("Closed 1 visible window", msg.reply_text.await_args.args[0])
 
     def test_open_chrome(self):
         fake = self.use_fake()
@@ -309,7 +374,25 @@ class TestWebNavigation(BotTestCase):
         self.assertIn(("key", "alt+space"), actions)
         self.assertIn(("key", "x"), actions)
 
-    def test_remoteapp_65430_skips_old_taskbar_coordinates(self):
+    def test_remoteapp_converts_instagram_app_window_to_normal_chrome(self):
+        from PIL import Image, ImageDraw
+        from types import SimpleNamespace
+        fake = self.use_fake()
+        fake.client = SimpleNamespace(width=1366, height=768)
+        fake.cfg = {"rdp_host": "220.158.164.87", "rdp_port": 65430}
+        pwa = Image.new("RGB", (1366, 768), "white")
+        normal = Image.new("RGB", (1366, 768), "white")
+        ImageDraw.Draw(normal).rectangle((84, 55, 112, 70), fill=(40, 40, 40))
+        fake.screenshot_nowait = AsyncMock(side_effect=[pwa, pwa, normal, normal])
+        focused = asyncio.run(bot._focus_edge_window(fake))
+        self.assertTrue(focused)
+        actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
+        self.assertIn(("key", "ctrl+n"), actions)
+        self.assertIn(("key", "win+up"), actions)
+        self.assertIn(("click", int(1366*.35), int(768*.033), 1, False), actions)
+        self.assertIn(("click", int(1366*.586), max(8, int(768*.025)), 1, False), actions)
+
+    def test_remoteapp_skips_old_taskbar_coordinates_when_no_browser(self):
         from PIL import Image
         from types import SimpleNamespace
         fake = self.use_fake()
@@ -319,7 +402,7 @@ class TestWebNavigation(BotTestCase):
         focused = asyncio.run(bot._focus_edge_window(fake))
         self.assertFalse(focused)
         actions = [a for call in fake.execute.await_args_list for a in call.args[0]]
-        self.assertNotIn("click", [action[0] for action in actions])
+        self.assertNotIn(("click", int(1366*.341), int(768*.974), 1, False), actions)
 
     def test_new_remoteapp_port_is_recognized(self):
         fake = MagicMock()
